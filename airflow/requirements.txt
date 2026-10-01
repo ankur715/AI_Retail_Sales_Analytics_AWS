@@ -1,0 +1,6 @@
+# Airflow pins its own dependency tree; the constraint file keeps every
+# transitive package at a version Airflow 3.3.2 was tested with.
+--constraint https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.11.txt
+apache-airflow==3.3.2
+apache-airflow-providers-standard
+-r ../requirements.txt

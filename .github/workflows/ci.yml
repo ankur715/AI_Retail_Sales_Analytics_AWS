@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Unit tests (no AWS -- S3 is moto, Redshift calls are recorded, the API is a TestClient)
+        run: pytest -q tests
+
+  dag-tests:
+    runs-on: ubuntu-latest
+    env:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      RETAIL_ENV: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install Airflow (constraint-pinned) + project deps
+        working-directory: airflow
+        run: pip install -r requirements.txt
+      - name: DAG integrity -- one DAG per pipeline in config/pipeline_config.csv (no Redshift needed)
+        working-directory: airflow
+        run: |
+          export AIRFLOW_HOME="$RUNNER_TEMP/airflow_home"
+          export AIRFLOW__CORE__DAGS_FOLDER="$(pwd)/dags"
+          airflow db migrate
+          pytest -q tests
+
+  terraform-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: fmt + validate (no AWS credentials needed)
+        working-directory: infra/terraform
+        run: |
+          terraform fmt -check -diff
+          terraform init -backend=false
+          terraform validate

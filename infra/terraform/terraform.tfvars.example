@@ -1,0 +1,2 @@
+allowed_cidr            = "203.0.113.10/32" # curl -s https://checkip.amazonaws.com
+redshift_admin_password = "ChangeMe123"     # 8-64 chars, upper + lower + digit

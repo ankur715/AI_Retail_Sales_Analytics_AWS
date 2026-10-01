@@ -1,0 +1,10 @@
+pipeline_id,client_id,retailer_id,product_level,source_type,source_location,file_format,schedule,lookback_weeks,is_active,promoted_to_prod
+C101_R201,C101,R201,serial,s3,landing/C101/R201/,csv,0 7 * * *,5,true,true
+C102_R201,C102,R201,serial,s3,landing/C102/R201/,csv,0 7 * * *,5,true,true
+C103_R201,C103,R201,serial,s3,landing/C103/R201/,csv,0 7 * * *,5,true,true
+C101_R202,C101,R202,sku,s3,landing/C101/R202/,xlsx,0 7 * * *,5,true,true
+C102_R202,C102,R202,sku,api,/v1/sales,json,0 8 * * 0,5,true,true
+C103_R202,C103,R202,sku,s3,landing/C103/R202/,xlsx,0 7 * * *,5,true,true
+C101_R203,C101,R203,style,s3,landing/C101/R203/,csv,0 7 * * *,5,true,true
+C102_R203,C102,R203,style,s3,landing/C102/R203/,csv,0 7 * * *,5,true,true
+C103_R203,C103,R203,style,s3,landing/C103/R203/,csv,0 7 * * *,5,true,false
