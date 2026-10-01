@@ -17,7 +17,9 @@ column picks the subflow, source_type picks how data arrives.
 
 S3 pipelines run daily and wait (in reschedule mode, so no worker slot is
 held) for that week's file. If nothing lands before the sensor times out,
-the run is skipped, not failed -- most days there is no file.
+the run is skipped, not failed -- most days there is no file. If several
+files are waiting (missed days, a drop split into _partN files), one run
+loads all of them; the newest file wins each overlapping week.
 
 Metadata is read from a local snapshot, never from Redshift at parse time;
 see etl/metadata.py and the retail_metadata_sync DAG below.
@@ -81,11 +83,11 @@ def build_dag(p: dict) -> DAG:
     ) as dag:
 
         @task
-        def begin(raw_key: str | None = None) -> dict:
+        def begin(raw_keys: list[str] | None = None) -> dict:
             from etl import steps
             c = get_current_context()
             run = c["dag_run"]
-            return steps.begin(p, run.run_after.date(), raw_key=raw_key,
+            return steps.begin(p, run.run_after.date(), raw_keys=raw_keys,
                                start_week=c["params"].get("start_week"), end_week=c["params"].get("end_week"),
                                dag_run_id=run.run_id).to_dict()
 
@@ -158,9 +160,9 @@ def build_dag(p: dict) -> DAG:
 
             @task.sensor(poke_interval=30 * 60, timeout=8 * 3600, mode="reschedule", soft_fail=True)
             def wait_for_file() -> PokeReturnValue:
-                from etl import s3_io
-                pending = s3_io.pending_files(landing)
-                return PokeReturnValue(is_done=bool(pending), xcom_value=pending[0] if pending else None)
+                from etl import s3_io, steps
+                pending = s3_io.pending_files(landing)[:steps.MAX_FILES_PER_LOAD]
+                return PokeReturnValue(is_done=bool(pending), xcom_value=pending)
 
             load = parse(begin(wait_for_file()))
         else:

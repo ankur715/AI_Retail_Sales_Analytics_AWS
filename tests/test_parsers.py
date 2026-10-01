@@ -93,3 +93,48 @@ def test_rows_after_window_fail_instead_of_being_dropped():
     from etl.parsers import WindowError
     with pytest.raises(WindowError, match="after the window end"):
         run("C101_R201", window=(date(2026, 7, 11), date(2026, 9, 19)))
+
+
+def test_missing_client_and_retailer_columns_are_stamped_from_metadata():
+    body = b"Week_Date,Product_ID,Sales,Inventory\n09/26/2026,010100000001,$10.00,5\n"
+    res = run("C101_R201", body=body)
+    assert res.output[["client_id", "retailer_id"]].values.tolist() == [["C101", "R201"]]
+
+
+def _drop(pipeline_id, week_end, n_weeks=5, part=None, parts=1):
+    from datetime import timedelta
+    p = PIPELINES[pipeline_id]
+    rows = normalized_rows(p["client_id"], p["retailer_id"], p["product_level"],
+                           week_range(week_end - timedelta(weeks=n_weeks - 1), week_end), as_of=week_end)
+    if part:
+        rows = rows[part - 1::parts]
+    return render(p, rows)
+
+
+def test_backlog_of_drops_newest_file_wins_each_week():
+    """Drops for Oct 3 and Oct 10 overlap on 4 weeks; the result must equal
+    loading them one after the other (Oct 10's numbers for shared weeks)."""
+    from etl.parsers import parse_files
+    oct3, oct10 = date(2026, 10, 3), date(2026, 10, 10)
+    kw = dict(level="serial", client_id="C101", retailer_id="R201", load_id="L", window=(date(2026, 9, 5), oct10))
+    res = parse_files([("a.csv", oct3, _drop("C101_R201", oct3)), ("b.csv", oct10, _drop("C101_R201", oct10))],
+                      "csv", **kw)
+    alone = parse(_drop("C101_R201", oct10), "csv", **kw).output
+    combined = res.output.set_index(["week_date", "product_id"]).sort_index()
+    newest = alone.set_index(["week_date", "product_id"]).sort_index()
+    shared = newest.index
+    assert combined.loc[shared, "sales"].equals(newest["sales"])           # Oct 10 wins the shared weeks
+    assert set(res.output["week_date"]) == set(week_range(date(2026, 9, 5), oct10))
+    a, b = res.stats["per_file"]
+    assert a["superseded_rows"] == 4 * 21 and a["rows_used"] == 21        # only Sep 5 comes from the Oct 3 file
+    assert b["superseded_rows"] == 0
+
+
+def test_parts_of_one_drop_are_unioned():
+    from etl.parsers import parse_files
+    oct3 = date(2026, 10, 3)
+    kw = dict(level="sku", client_id="C101", retailer_id="R202", load_id="L", window=(date(2026, 8, 29), oct3))
+    whole = parse(_drop("C101_R202", oct3), "xlsx", **kw).output
+    res = parse_files([(f"p{i}.xlsx", oct3, _drop("C101_R202", oct3, part=i, parts=2)) for i in (1, 2)], "xlsx", **kw)
+    assert len(res.output) == len(whole) and res.stats["superseded_rows"] == 0
+    assert round(res.output["sales"].sum(), 2) == round(whole["sales"].sum(), 2)

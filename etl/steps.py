@@ -5,7 +5,7 @@ execute exactly the same code.
 Old ibi subflow              step here
 ---------------------------  -------------------------------------------
 (parameters)                 begin          -> load_id, week window, audit row
-parser script                parse          -> s3 parsed/.../output.csv
+parser script                parse          -> every pending file -> s3 parsed/.../output_<client>_<retailer>.csv
 load to tmp (synonym)        load_tmp       -> COPY into landing.tmp_<level>
 load to prestg (sku/style)   load_prestg    -> aggregate tmp to key columns
 src_stats                    stats('src')
@@ -24,7 +24,7 @@ import io
 import json
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -33,6 +33,11 @@ from etl.levels import LEVELS
 from etl.weeks import resolve_window
 
 log = logging.getLogger(__name__)
+
+
+# A backlog bigger than this is loaded over several runs (oldest first), so
+# one load never pulls an unbounded number of files into memory.
+MAX_FILES_PER_LOAD = 20
 
 
 class ReconciliationError(Exception):
@@ -51,7 +56,7 @@ class LoadContext:
     load_type: str                 # automation | history
     window_start: date
     window_end: date
-    raw_key: str | None = None     # s3 key of the source file (or the saved API payload)
+    raw_keys: list[str] = field(default_factory=list)   # source files (or the saved API payload) in this load
     parsed_key: str | None = None
     dag_run_id: str | None = None
     parse_stats: dict = field(default_factory=dict)
@@ -89,16 +94,29 @@ def _parse_week(v) -> date | None:
 # begin / extract / parse
 # ---------------------------------------------------------------------------
 
-def begin(pipeline: dict, run_date: date, *, raw_key: str | None = None,
+def _files_label(keys: list[str]) -> str | None:
+    if not keys:
+        return None
+    label = keys[0] if len(keys) == 1 else f"{len(keys)} files: {keys[0]} .. {keys[-1].rsplit('/', 1)[-1]}"
+    return label[:500]
+
+
+def begin(pipeline: dict, run_date: date, *, raw_keys: list[str] | None = None,
           start_week=None, end_week=None, dag_run_id: str | None = None) -> LoadContext:
     """Fix the load's identity and week window, and open its audit row.
 
     Window precedence: explicit start/end (history load or backfill) >
-    the week in the source file's name > the run date."""
+    the weeks in the source file names > the run date. With several files
+    the automation window runs from the oldest file's 5 weeks to the newest
+    file's week, i.e. exactly what loading them one by one would touch."""
     start_week, end_week = _parse_week(start_week), _parse_week(end_week)
     load_type = "history" if (start_week or end_week) else "automation"
-    if not end_week and raw_key:
-        end_week = s3_io.file_week_end(raw_key)
+    raw_keys = list(raw_keys or [])
+    file_weeks = [w for w in map(s3_io.file_week_end, raw_keys) if w]
+    if file_weeks and not end_week:
+        end_week = max(file_weeks)
+    if file_weeks and not start_week and load_type == "automation":
+        start_week = min(file_weeks) - timedelta(weeks=pipeline["lookback_weeks"] - 1)
     window_start, window_end = resolve_window(run_date, pipeline["lookback_weeks"], start_week, end_week)
 
     ctx = LoadContext(
@@ -107,13 +125,13 @@ def begin(pipeline: dict, run_date: date, *, raw_key: str | None = None,
         file_format=pipeline["file_format"],
         load_id=f"{pipeline['pipeline_id']}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}",
         load_type=load_type, window_start=window_start, window_end=window_end,
-        raw_key=raw_key, dag_run_id=dag_run_id,
+        raw_keys=raw_keys, dag_run_id=dag_run_id,
     )
     redshift.run([("""
         INSERT INTO etl.load_audit (load_id, pipeline_id, dag_run_id, load_type, source_file,
                                     window_start, window_end, status)
-        VALUES (%(load_id)s, %(pipeline_id)s, %(dag_run_id)s, %(load_type)s, %(raw_key)s,
-                %(window_start)s, %(window_end)s, 'RUNNING');""", ctx.to_dict())])
+        VALUES (%(load_id)s, %(pipeline_id)s, %(dag_run_id)s, %(load_type)s, %(files)s,
+                %(window_start)s, %(window_end)s, 'RUNNING');""", ctx.to_dict() | {"files": _files_label(raw_keys)})])
     log.info("%s %s load %s, weeks %s..%s", ctx.pipeline_id, load_type, ctx.load_id, window_start, window_end)
     return ctx
 
@@ -138,31 +156,46 @@ def extract_api(ctx: LoadContext) -> LoadContext:
         records += page["data"]
         cursor = page["next_cursor"]
     name = f"{ctx.retailer_id}_{ctx.client_id}_{ctx.window_end:%Y%m%d}.json"
-    ctx.raw_key = config.s3_key("landing", ctx.client_id, ctx.retailer_id, name)
-    s3_io.put_bytes(ctx.raw_key, json.dumps(records).encode())
-    redshift.run([("UPDATE etl.load_audit SET source_file = %(raw_key)s WHERE load_id = %(load_id)s;", ctx.to_dict())])
-    log.info("Fetched %d records from the retailer API -> s3://%s/%s", len(records), config.S3_BUCKET, ctx.raw_key)
+    key = config.s3_key("landing", ctx.client_id, ctx.retailer_id, name)
+    s3_io.put_bytes(key, json.dumps(records).encode())
+    ctx.raw_keys = [key]
+    redshift.run([("UPDATE etl.load_audit SET source_file = %(key)s WHERE load_id = %(load_id)s;",
+                   {"key": key, "load_id": ctx.load_id})])
+    log.info("Fetched %d records from the retailer API -> s3://%s/%s", len(records), config.S3_BUCKET, key)
     return ctx
 
 
 def parse(ctx: LoadContext) -> LoadContext:
-    body = s3_io.get_bytes(ctx.raw_key)
-    result = parsers.parse(body, ctx.file_format, level=ctx.product_level, client_id=ctx.client_id,
-                           retailer_id=ctx.retailer_id, load_id=ctx.load_id,
-                           window=(ctx.window_start, ctx.window_end))
+    """Parse every file in the load into one output file, and record each
+    file's contribution in etl.load_files (lineage per source file)."""
+    files = [(k, s3_io.file_week_end(k), s3_io.get_bytes(k)) for k in ctx.raw_keys]
+    result = parsers.parse_files(files, ctx.file_format, level=ctx.product_level, client_id=ctx.client_id,
+                                 retailer_id=ctx.retailer_id, load_id=ctx.load_id,
+                                 window=(ctx.window_start, ctx.window_end))
     if result.output.empty:
-        raise ValueError(f"No rows for weeks {ctx.window_start}..{ctx.window_end} in {ctx.raw_key} "
+        raise ValueError(f"No rows for weeks {ctx.window_start}..{ctx.window_end} in {ctx.raw_keys} "
                          f"(stats: {result.stats}) -- wrong file, or the window needs start/end params")
 
     base = f"{ctx.client_id}/{ctx.retailer_id}/{ctx.load_id}"
-    ctx.parsed_key = config.s3_key("parsed", base, "output.csv")
+    ctx.parsed_key = config.s3_key("parsed", base, f"output_{ctx.client_id}_{ctx.retailer_id}.csv")
     s3_io.put_bytes(ctx.parsed_key, result.output_csv())
     if not result.rejects.empty:
         s3_io.put_bytes(config.s3_key("rejects", base, "parse_rejects.csv"), result.rejects_csv())
-    ctx.parse_stats = result.stats
-    redshift.run([("UPDATE etl.load_audit SET parse_stats = %(stats)s WHERE load_id = %(load_id)s;",
-                   {"stats": json.dumps(result.stats), "load_id": ctx.load_id})])
-    log.info("Parsed %s: %s", ctx.raw_key, result.stats)
+    ctx.parse_stats = {k: v for k, v in result.stats.items() if k != "per_file"}
+
+    redshift.run([
+        ("UPDATE etl.load_audit SET parse_stats = %(stats)s WHERE load_id = %(load_id)s;",
+         {"stats": json.dumps(ctx.parse_stats), "load_id": ctx.load_id}),
+        ("DELETE FROM etl.load_files WHERE load_id = %(load_id)s;", ctx.pair),
+        *[("""INSERT INTO etl.load_files (load_id, source_file, file_week_end, raw_rows, parsed_rows, rows_used,
+                                          superseded_rows, parse_rejects, out_of_window)
+              VALUES (%(load_id)s, %(file)s, %(week_end)s, %(raw_rows)s, %(parsed_rows)s, %(rows_used)s,
+                      %(superseded_rows)s, %(parse_rejects)s, %(out_of_window)s);""", {"load_id": ctx.load_id, **f})
+          for f in result.stats["per_file"]],
+    ])
+    log.info("Parsed %d file(s): %s", len(files), ctx.parse_stats)
+    for f in result.stats["per_file"]:
+        log.info("  %s: %s", f["file"], {k: v for k, v in f.items() if k != "file"})
     return ctx
 
 
@@ -336,12 +369,15 @@ def merge_fact(ctx: LoadContext) -> LoadContext:
 # housekeeping
 # ---------------------------------------------------------------------------
 
-def archive(ctx: LoadContext) -> str:
-    """Move the source file out of landing/ so the next run doesn't see it."""
-    name = ctx.raw_key.rsplit("/", 1)[-1]
-    dest = config.s3_key("archive", ctx.client_id, ctx.retailer_id, f"{ctx.load_id}__{name}")
-    s3_io.move(ctx.raw_key, dest)
-    return dest
+def archive(ctx: LoadContext) -> list[str]:
+    """Move the load's source files out of landing/ so the next run doesn't see them."""
+    moved = []
+    for key in ctx.raw_keys:
+        name = key.rsplit("/", 1)[-1]
+        dest = config.s3_key("archive", ctx.client_id, ctx.retailer_id, f"{ctx.load_id}__{name}")
+        s3_io.move(key, dest)
+        moved.append(dest)
+    return moved
 
 
 def finish(ctx: LoadContext) -> None:

@@ -1,7 +1,7 @@
 """Run one pipeline end to end from the command line -- the same steps, in
 the same order, as its Airflow DAG. Handy for development and debugging.
 
-    python -m etl.run C101_R201                                     # automation: oldest pending file, 5 weeks
+    python -m etl.run C101_R201                                     # automation: every pending file, 5-week windows
     python -m etl.run C101_R201 --start-week 2026-07-11 --end-week 2026-09-26   # history load
     python -m etl.run C102_R202                                     # API pipeline: last 5 completed weeks
 """
@@ -14,15 +14,14 @@ from etl import config, metadata, s3_io, steps
 
 def run_pipeline(pipeline_id: str, run_date: date, start_week=None, end_week=None) -> steps.LoadContext | None:
     p = metadata.get_pipeline(pipeline_id)
-    raw_key = None
+    raw_keys = []
     if p["source_type"] == "s3":
-        pending = s3_io.pending_files(config.s3_key(p["source_location"]))
-        if not pending:
+        raw_keys = s3_io.pending_files(config.s3_key(p["source_location"]))[:steps.MAX_FILES_PER_LOAD]
+        if not raw_keys:
             print(f"No files waiting in s3://{config.S3_BUCKET}/{config.s3_key(p['source_location'])}")
             return None
-        raw_key = pending[0]
 
-    ctx = steps.begin(p, run_date, raw_key=raw_key, start_week=start_week, end_week=end_week)
+    ctx = steps.begin(p, run_date, raw_keys=raw_keys, start_week=start_week, end_week=end_week)
     try:
         if p["source_type"] == "api":
             steps.extract_api(ctx)

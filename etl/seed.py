@@ -7,8 +7,11 @@ Promotion: retail_dev gets every row of config/pipeline_config.csv;
 retail_prod only gets rows with promoted_to_prod=true. Flipping that flag
 (through a reviewed PR) and re-seeding prod is how a feed goes live.
 
-Usage: RETAIL_ENV=dev python -m etl.seed
+Usage: RETAIL_ENV=dev python -m etl.seed                    # dims + metadata
+       RETAIL_ENV=dev python -m etl.seed --metadata-only    # just etl.pipeline_config
 """
+import sys
+
 from data_gen.catalog import CLIENTS, RETAILERS, UNMAPPED_SKU, load_pipelines, skus, style_names
 from etl import config, redshift
 
@@ -35,9 +38,25 @@ def product_rows() -> tuple[list[tuple], list[tuple]]:
     return products, stm
 
 
-def main() -> None:
-    products, stm = product_rows()
+def metadata_statements(pipelines: list[dict]) -> list[tuple]:
+    return [
+        ("DELETE FROM etl.pipeline_config;", None),
+        *[("""INSERT INTO etl.pipeline_config
+                (pipeline_id, client_id, retailer_id, product_level, source_type, source_location,
+                 file_format, schedule, lookback_weeks, is_active)
+              VALUES (%(pipeline_id)s, %(client_id)s, %(retailer_id)s, %(product_level)s, %(source_type)s,
+                      %(source_location)s, %(file_format)s, %(schedule)s, %(lookback_weeks)s, %(is_active)s);""", p)
+          for p in pipelines],
+    ]
+
+
+def main(metadata_only: bool = False) -> None:
     pipelines = pipeline_rows(config.ENV)
+    if metadata_only:
+        redshift.run(metadata_statements(pipelines))
+        print(f"{config.REDSHIFT_DB}: {len(pipelines)} pipelines in etl.pipeline_config")
+        return
+    products, stm = product_rows()
     statements = [
         ("DELETE FROM dim.client;", None),
         *[("INSERT INTO dim.client VALUES (%s, %s, %s);", (cid, name, cat)) for cid, (name, cat, _) in CLIENTS.items()],
@@ -47,13 +66,7 @@ def main() -> None:
         *[("INSERT INTO dim.product VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);", p) for p in products],
         ("DELETE FROM dim.product_stm;", None),
         *[("INSERT INTO dim.product_stm VALUES (%s, %s, %s, %s, %s, %s, %s);", m) for m in stm],
-        ("DELETE FROM etl.pipeline_config;", None),
-        *[("""INSERT INTO etl.pipeline_config
-                (pipeline_id, client_id, retailer_id, product_level, source_type, source_location,
-                 file_format, schedule, lookback_weeks, is_active)
-              VALUES (%(pipeline_id)s, %(client_id)s, %(retailer_id)s, %(product_level)s, %(source_type)s,
-                      %(source_location)s, %(file_format)s, %(schedule)s, %(lookback_weeks)s, %(is_active)s);""", p)
-          for p in pipelines],
+        *metadata_statements(pipelines),
     ]
     redshift.run(statements)
     print(f"{config.REDSHIFT_DB}: {len(CLIENTS)} clients, {len(RETAILERS)} retailers, "
@@ -61,4 +74,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(metadata_only="--metadata-only" in sys.argv)

@@ -1,5 +1,6 @@
-"""Parser: normalize a raw retailer file (CSV, XLSX or API JSON) into the
-standard output.csv that Redshift COPYs into the landing tables.
+"""Parser: normalize raw retailer files (CSV, XLSX or API JSON) into the
+standard output_<client>_<retailer>.csv that Redshift COPYs into the
+landing tables. One run can take several files (see parse_files).
 
 What it handles (see data_gen/generate.py for the raw layouts):
   - header spelling: "Week_Date", "Week Date", " week_date ", "weekEnding" -> week_date
@@ -9,14 +10,17 @@ What it handles (see data_gen/generate.py for the raw layouts):
   - UPC product ids with leading zeros (read as text, never as numbers)
   - summary/TOTAL rows and blank rows
   - files routed to the wrong pipeline (client/retailer mismatch)
+  - feeds with no client/retailer column (a vendor-portal export is already
+    one client): filled from the pipeline metadata, the authoritative values
 
 Rows that can't be parsed go to a parse-reject file with a reason. Rows
 OLDER than the load window are dropped and counted (a 12-week file in a
 5-week automation run only restates 5 weeks). Rows NEWER than the window
 fail the parse: loading the file would archive data that never reached
-the fact table (e.g. a history run whose end_week is before the file's). The output has a fixed
-column order per product level, prefixed with load_id so every downstream
-step can scope itself to this load.
+the fact table (e.g. a history run whose end_week is before the file's).
+
+The output has a fixed column order per product level, prefixed with
+load_id so every downstream step can scope itself to this load.
 """
 import io
 import json
@@ -107,6 +111,10 @@ def parse(body: bytes, file_format: str, *, level: str, client_id: str, retailer
           load_id: str, window: tuple[date, date]) -> ParseResult:
     raw = read_raw(body, file_format)
     raw.columns = [SYNONYMS.get(_norm(c), _norm(c)) for c in raw.columns]
+    # Present in the file: validated against the metadata below. Absent: stamped from it.
+    for col, value in (("client_id", client_id), ("retailer_id", retailer_id)):
+        if col not in raw.columns:
+            raw[col] = value
 
     needed = OUTPUT_COLUMNS[level][1:]   # everything but load_id
     missing = [c for c in needed if c not in raw.columns]
@@ -162,4 +170,43 @@ def parse(body: bytes, file_format: str, *, level: str, client_id: str, retailer
         stats={"raw_rows": int(len(df)), "parsed_rows": int(len(good)), "parse_rejects": int(len(rejects)),
                "out_of_window": out_of_window, "sales": round(float(good["sales"].sum()), 2),
                "inventory": int(good["inventory"].sum())},
+    )
+
+
+def parse_files(files: list[tuple[str, date | None, bytes]], file_format: str, *, level: str, client_id: str,
+                retailer_id: str, load_id: str, window: tuple[date, date]) -> ParseResult:
+    """Parse every file waiting for this pipeline into ONE output.
+
+    files: (name, file_week_end, body). When several weekly drops piled up,
+    they overlap (each re-sends 5 weeks), so for every week_date only the
+    rows of the newest file are kept -- the same end state as loading the
+    files one by one in order, in a single load. Files with the SAME
+    week_end are parts of one drop (R201_C101_20261003_part1.csv, _part2)
+    and are unioned."""
+    outputs, rejects, per_file = [], [], []
+    for name, week_end, body in files:
+        res = parse(body, file_format, level=level, client_id=client_id, retailer_id=retailer_id,
+                    load_id=load_id, window=window)
+        outputs.append(res.output.assign(_file=name, _file_week=week_end or date.min))
+        rejects.append(res.rejects.assign(source_file=name))
+        per_file.append({"file": name, "week_end": week_end.isoformat() if week_end else None, **res.stats})
+
+    combined = pd.concat(outputs, ignore_index=True)
+    newest = combined.groupby("week_date")["_file_week"].transform("max")
+    keep = combined["_file_week"] == newest
+    for f in per_file:   # rows of each file that survive (vs superseded by a newer drop)
+        used = int((keep & (combined["_file"] == f["file"])).sum())
+        f["superseded_rows"], f["rows_used"] = f["parsed_rows"] - used, used
+    output = combined[keep].drop(columns=["_file", "_file_week"]).reset_index(drop=True)
+
+    return ParseResult(
+        output=output,
+        rejects=pd.concat(rejects, ignore_index=True),
+        out_of_window=sum(f["out_of_window"] for f in per_file),
+        stats={"files": len(files), "raw_rows": sum(f["raw_rows"] for f in per_file),
+               "parsed_rows": int(len(output)), "parse_rejects": sum(f["parse_rejects"] for f in per_file),
+               "out_of_window": sum(f["out_of_window"] for f in per_file),
+               "superseded_rows": sum(f["superseded_rows"] for f in per_file),
+               "sales": round(float(output["sales"].sum()), 2), "inventory": int(output["inventory"].sum()),
+               "per_file": per_file},
     )

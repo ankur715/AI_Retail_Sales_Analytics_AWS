@@ -22,7 +22,7 @@ The analytics chatbot over the fact table (natural language → SQL, like
  Retailer feeds                        S3: retail-sales-lake-<acct>/<env>/
  ─────────────                         ──────────────────────────────────────────────
  R201 Northgate  CSV  serial level ─┐   landing/<client>/<retailer>/  files as received
- R202 Summit     XLSX sku level    ─┼─> parsed/.../<load_id>/output.csv  (parser output, what Redshift COPYs)
+ R202 Summit     XLSX sku level    ─┼─> parsed/.../<load_id>/output_<client>_<retailer>.csv  (what Redshift COPYs)
  R203 Harbor     CSV  style level  ─┘   rejects/.../<load_id>/        parse rejects + unmapped products
  C102@R202       REST API (mock) ────>  archive/<client>/<retailer>/  source files after a successful load
                                                      │ COPY (IAM role, parsed/ only)
@@ -34,6 +34,18 @@ The analytics chatbot over the fact table (natural language → SQL, like
 ```
 
 ### One DAG per metadata row
+
+`build_dag(row)` in `airflow/dags/retail_sales_dag_factory.py` is the only
+DAG definition. Each metadata column switches one thing, and everything
+else is shared code:
+
+| Column | What it changes |
+|---|---|
+| `pipeline_id`, `client_id`, `retailer_id` | DAG id and tags; every SQL step is scoped to this pair and its `load_id`; parser validation (or stamping) of client/retailer |
+| `product_level` | the subflow: `etl/levels.py` gives the landing tables, whether `prestg` exists, the key columns, and the STM join |
+| `source_type` | `s3` → `wait_for_file` sensor on `source_location`; `api` → `extract_api` |
+| `file_format` | the parser's reader: CSV, XLSX (header-row detection) or JSON |
+| `schedule`, `lookback_weeks`, `is_active` | cron, the automation window, and whether the DAG exists at all |
 
 ```
 retail_sales__C101_R201__serial   (s3, daily)
@@ -51,13 +63,13 @@ retail_sales__C102_R202__sku      (api, Sundays) begin ─► extract_api ─►
 | ibi Data Migrator | Here |
 |---|---|
 | Per-flow parameters (week start/end, client_id, retailer_id, source_dir, output_dir, archive_dir) | `etl.pipeline_config` row + `RETAIL_ENV` + optional `start_week`/`end_week` DAG params |
-| Python parser → `output.csv`, read through a synonym | `etl/parsers.py` → `s3://…/parsed/…/output.csv`, `COPY` into `landing.tmp_<level>` |
+| Python parser → `output.csv`, read through a synonym | `etl/parsers.py` → `s3://…/parsed/<client>/<retailer>/<load_id>/output_<client>_<retailer>.csv`, `COPY` into `landing.tmp_<level>` |
 | Load to tmp (serial) / prestg_sku / prestg_style | `load_tmp`, plus `load_prestg` for sku/style (rolls store rows up to the key columns) |
 | src_stats / stg_stats / rej_stats | `etl.etl_stats` with `source` = `src` / `stg` / `rej`, by week, client and retailer |
 | Load to staging: LEFT JOIN to the dimension STM | `stage.stg_sales`, LEFT JOIN `dim.product_stm`; `product_id IS NULL` = rejected |
 | Merge staging to facts, last 5 weeks | Redshift `MERGE` into `fact.fact_sales` over the load window |
 | *(new)* | `reconcile`: fails the run unless src = stg + rej (rows, sales, inventory) for every week |
-| *(new)* | `etl.load_audit`: one row per run with window, file, parse stats, inserted/updated counts |
+| *(new)* | `etl.load_audit`: one row per run with window, files, parse stats, inserted/updated counts; `etl.load_files`: one row per source file |
 
 ## The three product levels
 
@@ -82,6 +94,22 @@ metrics), so a single MERGE serves every feed.
 | C103_R203 | C103 | R203 | style | s3 | csv | `0 7 * * *` | 5 | ✗ (dev only) |
 | … 9 rows | | | | | | | | |
 
+**Updating the metadata.** The CSV is the source of truth, reviewed like code:
+
+1. Edit `config/pipeline_config.csv`: add a row for a new feed, or change
+   `schedule`, `lookback_weeks`, `is_active` or `promoted_to_prod`. Open a
+   PR to `dev`.
+2. `RETAIL_ENV=dev python -m etl.seed --metadata-only` replaces
+   `etl.pipeline_config` in `retail_dev`.
+3. Trigger `retail_metadata_sync`, or wait for its 06:00 run. The snapshot
+   refreshes, and within about 30 seconds Airflow shows the new or changed
+   DAG. A pipeline whose `is_active` is false simply disappears; its run
+   history is kept.
+4. After the merge to `main`: run step 2 with `RETAIL_ENV=prod`, then sync
+   in the prod Airflow.
+
+Don't hand-edit `etl.pipeline_config` with SQL: the next seed overwrites it.
+
 **The DAG factory never queries Redshift.** Airflow re-parses DAG files about
 every 30 seconds, and each query would wake (and bill) the Serverless
 workgroup. Instead, the `retail_metadata_sync` DAG copies
@@ -102,8 +130,18 @@ CI, it falls back to the seed CSV.
   - *S3:* the 5 weeks ending at the week in the file name, e.g. `R201_C101_20261003.csv`.
   - *API:* the 5 weeks ending at the last completed Saturday.
 - **History or backfill:** trigger the DAG with `{"start_week": "2026-07-11", "end_week": "2026-09-26"}`.
-- **Pending files load oldest week first (FIFO).** That way an older
-  restatement never overwrites a newer one.
+- **Several files in one run.** Everything waiting in landing/ (up to 20
+  files) is loaded together:
+  - a backlog of weekly drops (for example, the files for Oct 10 and Oct 17
+    both waiting)
+  - one drop split into parts (`R201_C101_20261017_part1.csv`, `_part2`)
+
+  Parts of the same week are combined. Where drops overlap, the newest
+  file's rows win each week. The window runs from the oldest file's 5 weeks
+  to the newest file's week. The end state is exactly what loading the files
+  one by one would produce, but in one load, one MERGE and one audit row.
+  `etl.load_files` records what each file contributed, including the rows a
+  newer file superseded.
 - **Rows newer than the window fail the parse instead of being dropped.**
   Loading the file would otherwise archive data that never reached the fact
   table. (Found during the first Airflow run, see below.)
@@ -180,13 +218,13 @@ To run one pipeline from the CLI without Airflow (same steps as its DAG):
 
 ```bash
 .venv/bin/python -m etl.run C101_R201 --start-week 2026-07-11 --end-week 2026-09-26   # history
-.venv/bin/python -m etl.run C101_R201                                                 # automation
+.venv/bin/python -m etl.run C101_R201                                                 # automation (all pending files)
 ```
 
 ## Tests
 
 ```bash
-.venv/bin/pytest -q tests                  # 40 unit tests: parser layouts, week windows, STM, SQL per level, S3 FIFO/archive (moto), API paging
+.venv/bin/pytest -q tests                  # 44 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging
 cd airflow && ../.venv/bin/pytest -q tests # 8 DAG integrity tests: one DAG per pipeline, subflow shape, reconcile gates the merge, pools
 ```
 
@@ -195,7 +233,7 @@ CI (`.github/workflows/ci.yml`) runs both suites plus `terraform fmt` and
 
 ## Verified on live AWS
 
-`terraform apply` created all 15 resources. Migrations V001–V008 applied to
+`terraform apply` created all 15 resources. Migrations V001–V009 applied to
 both `retail_dev` and `retail_prod`. Then all 9 dev pipelines loaded 12
 weeks of history and one weekly drop, through the CLI and through Airflow,
 including the API feed: **22 loads, all reconciled (src = stg + rej), 9 pairs ×
@@ -203,12 +241,20 @@ including the API feed: **22 loads, all reconciled (src = stg + rej), 9 pairs ×
 window, for example *20 inserted (new week), 80 updated (4 restated weeks)*,
 and left older weeks untouched.
 
+A multi-file run through Airflow loaded 3 files in one load: the Oct 10
+drop plus the Oct 17 drop in two parts. Only Sep 12 came from the older
+file; its 84 overlapping rows were superseded. The result was 40 fact rows
+inserted and 80 updated, and the load reconciled.
+
 **The first Airflow run surfaced one real bug.** Unpausing a DAG creates its
 latest scheduled run. That run took a feed's history file as a 5-week
 automation load. A manual history run (ending Sep 26) then picked up the next
 file, which ran to Oct 3, and the parser silently dropped the Oct 3 rows
 before the file was archived. Rows newer than the window now fail the parse,
 and the runbook is: load history *before* unpausing a new feed.
+
+Step-by-step console checks (S3, Redshift Query Editor, IAM, usage limit):
+[docs/AWS_CHECK_GUIDE.md](docs/AWS_CHECK_GUIDE.md).
 
 ## Cost
 

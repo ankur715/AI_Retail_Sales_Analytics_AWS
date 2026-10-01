@@ -7,9 +7,10 @@ import boto3
 
 from etl import config
 
-# Retailer files are named <retailer>_<client>_<YYYYMMDD>.<ext>, the date
-# being the last week-ending Saturday in the file.
-FILE_WEEK = re.compile(r"_(\d{8})\.(csv|xlsx|json)$", re.IGNORECASE)
+# Retailer files are named <retailer>_<client>_<YYYYMMDD>[_partN].<ext>, the
+# date being the last week-ending Saturday in the file; a large drop may come
+# split into parts that share the date.
+FILE_WEEK = re.compile(r"_(\d{8})(?:_part\d+)?\.(csv|xlsx|json)$", re.IGNORECASE)
 
 
 def client():
@@ -37,9 +38,8 @@ def file_week_end(key: str) -> date | None:
 
 
 def pending_files(landing_prefix: str) -> list[str]:
-    """Source files waiting in landing/, oldest week first (FIFO): if several
-    weekly drops piled up, they're loaded in the order the retailer sent
-    them so a newer restatement is never overwritten by an older one."""
+    """Source files waiting in landing/, oldest week first. All of them are
+    loaded in one run (parsers.parse_files), newest file winning each week."""
     keys = [k for k in list_keys(landing_prefix) if file_week_end(k)]
     return sorted(keys, key=lambda k: (file_week_end(k), k))
 
