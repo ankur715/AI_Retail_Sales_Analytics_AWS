@@ -162,6 +162,61 @@ CI, it falls back to the seed CSV.
   Loading the file would otherwise archive data that never reached the fact
   table. (Found during the first Airflow run, see below.)
 
+## How runs start: today and event-driven options
+
+Airflow's always-on services (scheduler, DAG processor, triggerer) don't
+move data. The DAG processor only re-reads the factory file about every
+30 seconds to rebuild DAG *definitions* (no S3, no Redshift). Work happens
+only when the scheduler creates a run, from a cron schedule or a manual
+trigger.
+
+| Option | How a run starts | Latency | Status |
+|---|---|---|---|
+| **A. Cron + sensor** | 07:00 UTC daily; `wait_for_file` checks landing every 30 min for up to 8 h, and the run skips if nothing lands | ≤ 30 min | **Implemented** |
+| **B. Cron, several times a day** | e.g. `0 7,13,19 * * *`; the first step lists landing and skips immediately if empty | ≤ the gap between runs | Config only: change `schedule` in the metadata and shorten the sensor timeout |
+| **C1. S3 event → SQS → Airflow** | S3 "file created" event → SQS queue; Airflow 3's triggerer listens to the queue and starts the DAG | seconds | Not implemented |
+| **C2. S3 event → Lambda → Airflow REST API** | Lambda calls `POST /api/v2/dags/{dag_id}/dagRuns` with the file keys | seconds | Not implemented (decided against) |
+
+Everything after `begin` is identical in all four. Only how the run starts
+changes, because a run already loads every pending file under the
+client/retailer's landing path.
+
+### What event-driven would cost
+
+| Item | Volume here (hundreds of files a week) | Cost |
+|---|---|---|
+| S3 event notifications | per file | free |
+| SQS | a few thousand messages, plus Airflow's long-poll requests (~130k/month) | free tier is 1M requests/month → **$0** |
+| Lambda (C2 only) | a few thousand ~1 s invocations | free tier is 1M requests + 400k GB-s/month → **$0** |
+| **An Airflow that is always on and reachable** (the real cost) | — | Laptop: $0, but runs only while it's awake, and Lambda can't reach `localhost`. Small EC2 running Airflow: roughly **$30–40/month**. Managed MWAA: roughly **$250–350+/month** for the smallest environment. Check current AWS pricing. |
+| Build effort | Terraform for the bucket notification + queue (+ Lambda and an API-auth secret for C2), plus the DAG/trigger changes and tests | about a day |
+
+**Decision:** stay on option A. Weekly retailer files don't need
+seconds-level latency, and the event services save nothing until Airflow
+runs on an always-on host. If that happens, C1 (SQS) is preferred over the
+Lambda path: nothing has to reach into Airflow, so no public endpoint or
+API credentials are needed, and the AWS side stays $0 at this volume.
+
+## Scaling to hundreds of retailers × hundreds of clients
+
+One DAG per client/retailer pair suits a handful of feeds, not tens of
+thousands. The same metadata-driven design scales by changing the unit of
+work:
+
+- **One DAG per retailer (or per retailer + level), mapped over clients.**
+  The DAG lists which clients' files arrived and runs the subflow per pair
+  with dynamic task mapping (`.expand()`). The metadata becomes the list of
+  *expected* feeds, not a list of DAGs.
+- **Retailer layouts as metadata.** A per-retailer parser spec (column
+  synonyms, date format, header row, rows to skip) replaces code, so
+  onboarding Amazon or Saks is a config row plus a sample file.
+- **Set-based Redshift work.** Instead of serializing pairs through a
+  1-slot pool, process a batch together: one COPY of all of a retailer's
+  parsed files, one mapping pass, one MERGE. Alternatively, give each load
+  its own temp staging tables so loads stop colliding and the pool can grow.
+- **Parsing off the Airflow workers** (ECS/Fargate, Lambda or Glue), and
+  Airflow on MWAA or Astronomer with Celery/Kubernetes executors.
+
 ## Dev vs prod
 
 The same code and DAGs run in both environments. `RETAIL_ENV` only changes
@@ -173,6 +228,12 @@ The same code and DAGs run in both environments. `RETAIL_ENV` only changes
 | S3 prefix | `dev/landing`, `dev/parsed`, … | `prod/landing`, … |
 | Pipelines | every row of the seed | rows with `promoted_to_prod = true` |
 | Airflow | `./start_airflow.sh` on :8080 | `RETAIL_ENV=prod ./start_airflow.sh` on :8081, with its own `AIRFLOW_HOME` |
+
+**History in prod:** prod reads only `prod/landing/`. Files loaded in dev
+are archived under `dev/`, so a prod history load needs them dropped into
+`prod/landing/` again. Production setups usually avoid that with one
+prod-owned raw zone that both environments read, or by copying prod
+landing down to dev.
 
 **Promotion:** develop a new feed in dev, load its history with
 `start_week`/`end_week`, and check `etl.v_load_reconciliation` and the
@@ -261,6 +322,15 @@ A multi-file run through Airflow loaded 3 files in one load: the Oct 10
 drop plus the Oct 17 drop in two parts. Only Sep 12 came from the older
 file; its 84 overlapping rows were superseded. The result was 40 fact rows
 inserted and 80 updated, and the load reconciled.
+
+**The daily usage limit was hit once, during testing.** A day of repeated
+test loads plus a monitoring loop that queried Redshift every 30 seconds
+reached the 3 RPU-hour cap. Serverless bills a 60-second minimum each time
+it wakes, so short, spaced-out queries add up. The workgroup refused
+queries until 00:00 UTC, exactly as configured. The C101_R202 run that
+failed left its Oct 10 file in landing (nothing was archived or
+half-written), so the next scheduled run picks it up. Lesson: monitor runs
+from Airflow's own database, never by polling Redshift.
 
 **The first Airflow run surfaced one real bug.** Unpausing a DAG creates its
 latest scheduled run. That run took a feed's history file as a 5-week
