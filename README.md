@@ -35,6 +35,10 @@ The analytics chatbot over the fact table (natural language → SQL, like
 
 ### One DAG per metadata row
 
+![Airflow: one DAG per metadata row](pics/airflow_dags.jpg)
+
+*Local dev Airflow: one generated DAG per `etl.pipeline_config` row plus `retail_metadata_sync`; schedules come from the `schedule` column (shown in the browser's UTC−4, so 07:00 UTC reads 03:00).*
+
 `build_dag(row)` in `airflow/dags/retail_sales_dag_factory.py` is the only
 DAG definition. Each metadata column switches one thing, and everything
 else is shared code:
