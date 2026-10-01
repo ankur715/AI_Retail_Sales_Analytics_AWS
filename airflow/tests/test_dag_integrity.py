@@ -47,10 +47,22 @@ def test_subflow_shape(dagbag, dag_id, first, has_prestg):
     assert f"{level}_subflow.reconcile" in dag.get_task("merge_fact").upstream_task_ids
 
 
-def test_redshift_writers_share_one_pool(dagbag):
+@pytest.mark.parametrize("dag_id", ["retail_sales__C101_R201__serial", "retail_sales__C101_R202__sku",
+                                    "retail_sales__C101_R203__style", "retail_sales__C102_R202__sku"])
+def test_every_redshift_writer_is_in_the_pool(dagbag, dag_id):
+    """Only pure S3/API tasks may run outside the 1-slot redshift pool."""
+    for t in dagbag.dags[dag_id].tasks:
+        expected = "default_pool" if t.task_id in {"wait_for_file", "extract_api", "parse", "archive"} else "redshift"
+        assert t.pool == expected, t.task_id
+
+
+def test_later_steps_outrank_earlier_ones(dagbag):
+    """With weight_rule=upstream, an in-flight load's merge beats another
+    pipeline's first load step when both wait for the redshift slot."""
     dag = dagbag.dags["retail_sales__C101_R202__sku"]
-    for tid in ["sku_subflow.load_tmp", "sku_subflow.load_staging", "merge_fact"]:
-        assert dag.get_task(tid).pool == "redshift"
+    weight = {t.task_id: len(t.get_flat_relative_ids(upstream=True)) for t in dag.tasks}
+    assert all(str(t.weight_rule).lower().endswith("upstream") for t in dag.tasks)
+    assert weight["merge_fact"] > weight["sku_subflow.reconcile"] > weight["sku_subflow.load_tmp"] > weight["begin"]
 
 
 def test_s3_sensor_skips_instead_of_failing(dagbag):

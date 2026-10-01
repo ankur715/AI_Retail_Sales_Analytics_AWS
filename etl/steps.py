@@ -6,6 +6,7 @@ Old ibi subflow              step here
 ---------------------------  -------------------------------------------
 (parameters)                 begin          -> load_id, week window, audit row
 parser script                parse          -> every pending file -> s3 parsed/.../output_<client>_<retailer>.csv
+                             record_parse   -> parse stats + per-file lineage (etl.load_files)
 load to tmp (synonym)        load_tmp       -> COPY into landing.tmp_<level>
 load to prestg (sku/style)   load_prestg    -> aggregate tmp to key columns
 src_stats                    stats('src')
@@ -15,6 +16,10 @@ stg_stats / rej_stats        stats('stg') / stats('rej')
 merge to facts               merge_fact     -> MERGE over the window
 (file housekeeping)          archive        -> landing/ -> archive/
                              finish         -> audit SUCCESS
+
+Redshift writes: only begin, record_parse and the steps after it touch
+Redshift; extract_api and parse are pure S3/API work, so they can run in
+parallel across pipelines while Redshift writers queue in one Airflow pool.
 
 Idempotency: every write step first deletes what a previous attempt of the
 same load (or the previous load of the same client/retailer) left behind,
@@ -60,6 +65,7 @@ class LoadContext:
     parsed_key: str | None = None
     dag_run_id: str | None = None
     parse_stats: dict = field(default_factory=dict)
+    file_stats: list[dict] = field(default_factory=list)   # per source file, written by record_parse
     fact_inserted: int | None = None
     fact_updated: int | None = None
 
@@ -158,16 +164,14 @@ def extract_api(ctx: LoadContext) -> LoadContext:
     name = f"{ctx.retailer_id}_{ctx.client_id}_{ctx.window_end:%Y%m%d}.json"
     key = config.s3_key("landing", ctx.client_id, ctx.retailer_id, name)
     s3_io.put_bytes(key, json.dumps(records).encode())
-    ctx.raw_keys = [key]
-    redshift.run([("UPDATE etl.load_audit SET source_file = %(key)s WHERE load_id = %(load_id)s;",
-                   {"key": key, "load_id": ctx.load_id})])
+    ctx.raw_keys = [key]   # record_parse writes it to the audit row
     log.info("Fetched %d records from the retailer API -> s3://%s/%s", len(records), config.S3_BUCKET, key)
     return ctx
 
 
 def parse(ctx: LoadContext) -> LoadContext:
-    """Parse every file in the load into one output file, and record each
-    file's contribution in etl.load_files (lineage per source file)."""
+    """Parse every file in the load into one output file in S3. No Redshift
+    here -- record_parse writes the results."""
     files = [(k, s3_io.file_week_end(k), s3_io.get_bytes(k)) for k in ctx.raw_keys]
     result = parsers.parse_files(files, ctx.file_format, level=ctx.product_level, client_id=ctx.client_id,
                                  retailer_id=ctx.retailer_id, load_id=ctx.load_id,
@@ -182,20 +186,26 @@ def parse(ctx: LoadContext) -> LoadContext:
     if not result.rejects.empty:
         s3_io.put_bytes(config.s3_key("rejects", base, "parse_rejects.csv"), result.rejects_csv())
     ctx.parse_stats = {k: v for k, v in result.stats.items() if k != "per_file"}
+    ctx.file_stats = result.stats["per_file"]
+    log.info("Parsed %d file(s): %s", len(files), ctx.parse_stats)
+    for f in ctx.file_stats:
+        log.info("  %s: %s", f["file"], {k: v for k, v in f.items() if k != "file"})
+    return ctx
 
+
+def record_parse(ctx: LoadContext) -> LoadContext:
+    """Write what parse found: the audit row's files + stats, and one
+    etl.load_files row per source file (lineage)."""
     redshift.run([
-        ("UPDATE etl.load_audit SET parse_stats = %(stats)s WHERE load_id = %(load_id)s;",
-         {"stats": json.dumps(ctx.parse_stats), "load_id": ctx.load_id}),
+        ("UPDATE etl.load_audit SET source_file = %(files)s, parse_stats = %(stats)s WHERE load_id = %(load_id)s;",
+         {"files": _files_label(ctx.raw_keys), "stats": json.dumps(ctx.parse_stats), "load_id": ctx.load_id}),
         ("DELETE FROM etl.load_files WHERE load_id = %(load_id)s;", ctx.pair),
         *[("""INSERT INTO etl.load_files (load_id, source_file, file_week_end, raw_rows, parsed_rows, rows_used,
                                           superseded_rows, parse_rejects, out_of_window)
               VALUES (%(load_id)s, %(file)s, %(week_end)s, %(raw_rows)s, %(parsed_rows)s, %(rows_used)s,
                       %(superseded_rows)s, %(parse_rejects)s, %(out_of_window)s);""", {"load_id": ctx.load_id, **f})
-          for f in result.stats["per_file"]],
+          for f in ctx.file_stats],
     ])
-    log.info("Parsed %d file(s): %s", len(files), ctx.parse_stats)
-    for f in result.stats["per_file"]:
-        log.info("  %s: %s", f["file"], {k: v for k, v in f.items() if k != "file"})
     return ctx
 
 
@@ -385,7 +395,19 @@ def finish(ctx: LoadContext) -> None:
                       WHERE load_id = %(load_id)s;""", ctx.pair)])
 
 
-def fail(load_id: str, error: str) -> None:
-    redshift.run([("""UPDATE etl.load_audit SET status = 'FAILED', finished_at = GETDATE(),
-                             error_message = LEFT(%(err)s, 2000)
-                      WHERE load_id = %(load_id)s;""", {"load_id": load_id, "err": error})])
+def fail(load_id: str, error: str, attempts: int = 5) -> None:
+    """Close the audit row as FAILED. Called from Airflow's failure callback,
+    which can't run inside a pool, so it may collide with another pipeline's
+    write; Redshift then aborts one side (serializable isolation, error 1023)
+    and this simply tries again."""
+    import time
+    for attempt in range(1, attempts + 1):
+        try:
+            redshift.run([("""UPDATE etl.load_audit SET status = 'FAILED', finished_at = GETDATE(),
+                                     error_message = LEFT(%(err)s, 2000)
+                              WHERE load_id = %(load_id)s;""", {"load_id": load_id, "err": error})])
+            return
+        except Exception as e:   # psycopg2 surfaces 1023 as a generic error with this text
+            if "1023" not in str(e) and "Serializable isolation" not in str(e) or attempt == attempts:
+                raise
+            time.sleep(2 * attempt)

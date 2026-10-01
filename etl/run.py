@@ -26,6 +26,7 @@ def run_pipeline(pipeline_id: str, run_date: date, start_week=None, end_week=Non
         if p["source_type"] == "api":
             steps.extract_api(ctx)
         steps.parse(ctx)
+        steps.record_parse(ctx)
         steps.load_tmp(ctx)
         if ctx.level.prestg_table:
             steps.load_prestg(ctx)

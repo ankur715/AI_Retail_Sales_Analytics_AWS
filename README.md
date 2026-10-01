@@ -49,7 +49,7 @@ else is shared code:
 
 ```
 retail_sales__C101_R201__serial   (s3, daily)
-  wait_for_file ─► begin ─► parse ─► serial_subflow ─────────────────────────────────────────────┐
+  wait_for_file ─► begin ─► parse ─► record_parse ─► serial_subflow ─────────────────────────────────────────────┐
                                      load_tmp ─► src_stats ─► load_staging ─► stg_stats ─┐       │
                                                                           └─► rej_stats ─┴► reconcile
                                                                                                  ▼
@@ -57,7 +57,7 @@ retail_sales__C101_R201__serial   (s3, daily)
 
 retail_sales__C101_R202__sku      sku_subflow:   load_tmp ─► load_prestg ─► src_stats ─► ... (same)
 retail_sales__C101_R203__style    style_subflow: load_tmp ─► load_prestg ─► src_stats ─► ... (same)
-retail_sales__C102_R202__sku      (api, Sundays) begin ─► extract_api ─► parse ─► sku_subflow ─► ...
+retail_sales__C102_R202__sku      (api, Sundays) begin ─► extract_api ─► parse ─► record_parse ─► sku_subflow ─► ...
 ```
 
 | ibi Data Migrator | Here |
@@ -93,6 +93,22 @@ metrics), so a single MERGE serves every feed.
 | C102_R202 | C102 | R202 | sku | **api** | json | `0 8 * * 0` | 5 | ✓ |
 | C103_R203 | C103 | R203 | style | s3 | csv | `0 7 * * *` | 5 | ✗ (dev only) |
 | … 9 rows | | | | | | | | |
+
+**Parallel pipelines and the `redshift` pool.** All feeds share the
+landing, stage, stats and fact tables, and Redshift's serializable isolation
+aborts concurrent writers (error 1023). So every task that writes to
+Redshift runs in a 1-slot Airflow pool. S3 and API work (`wait_for_file`,
+`extract_api`, `parse`, `archive`) runs in parallel.
+
+When several pipelines wait for the slot, Airflow takes the highest
+`priority_weight` first, then the oldest run. `weight_rule="upstream"`
+gives later steps more weight, so a load that has started runs through
+`merge_fact` before the next pipeline's `load_tmp` begins. This was
+verified live: with three DAGs triggered together, one load ran tmp →
+merge without interleaving while the other's API pull and parse ran
+alongside it. `max_active_runs=1` keeps a pipeline from overlapping itself:
+a manual run waits behind a scheduled run whose sensor is still polling.
+The failure callback can't use a pool, so it retries on error 1023.
 
 **Updating the metadata.** The CSV is the source of truth, reviewed like code:
 
@@ -224,8 +240,8 @@ To run one pipeline from the CLI without Airflow (same steps as its DAG):
 ## Tests
 
 ```bash
-.venv/bin/pytest -q tests                  # 44 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging
-cd airflow && ../.venv/bin/pytest -q tests # 8 DAG integrity tests: one DAG per pipeline, subflow shape, reconcile gates the merge, pools
+.venv/bin/pytest -q tests                  # 46 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging
+cd airflow && ../.venv/bin/pytest -q tests # 12 DAG integrity tests: one DAG per pipeline, subflow shape, reconcile gates the merge, every Redshift writer pooled, priority order
 ```
 
 CI (`.github/workflows/ci.yml`) runs both suites plus `terraform fmt` and

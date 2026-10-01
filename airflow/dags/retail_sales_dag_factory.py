@@ -5,7 +5,7 @@ single template. Adding a feed = adding a metadata row; the product_level
 column picks the subflow, source_type picks how data arrives.
 
     retail_sales__C101_R201__serial   (s3, daily 07:00)
-      wait_for_file -> begin -> parse
+      wait_for_file -> begin -> parse -> record_parse
         -> serial_subflow[ load_tmp -> src_stats -> load_staging -> stg_stats, rej_stats -> reconcile ]
         -> merge_fact -> archive -> finish
 
@@ -13,13 +13,23 @@ column picks the subflow, source_type picks how data arrives.
       ... sku_subflow[ load_tmp -> load_prestg -> src_stats -> ... ]
 
     retail_sales__C102_R202__sku      (api, Sundays 08:00)
-      begin -> extract_api -> parse -> sku_subflow[...] -> merge_fact -> archive -> finish
+      begin -> extract_api -> parse -> record_parse -> sku_subflow[...] -> merge_fact -> archive -> finish
 
 S3 pipelines run daily and wait (in reschedule mode, so no worker slot is
 held) for that week's file. If nothing lands before the sensor times out,
 the run is skipped, not failed -- most days there is no file. If several
 files are waiting (missed days, a drop split into _partN files), one run
 loads all of them; the newest file wins each overlapping week.
+
+Concurrency across pipelines: every task that writes to Redshift runs in
+the `redshift` pool (1 slot) -- the feeds share landing/stage/stats/fact
+tables, and Redshift's serializable isolation aborts concurrent writers
+(error 1023). S3/API work (wait_for_file, extract_api, parse, archive) runs
+in parallel. When several pipelines queue for the slot, Airflow picks the
+highest priority_weight, then the oldest run. weight_rule="upstream" gives
+tasks further along the flow more weight, so a load that has started
+finishes (through merge_fact) before another pipeline's load begins,
+instead of every pipeline loading tmp tables first and merging last.
 
 Metadata is read from a local snapshot, never from Redshift at parse time;
 see etl/metadata.py and the retail_metadata_sync DAG below.
@@ -40,6 +50,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from etl import config, metadata  # noqa: E402
 
 REDSHIFT_POOL = "redshift"   # 1 slot: Redshift's serializable isolation aborts concurrent writers to shared tables
+S3_ONLY_TASKS = {"wait_for_file", "extract_api", "parse", "archive"}   # everything else writes to Redshift
 
 
 def _ctx(d: dict):
@@ -78,11 +89,12 @@ def build_dag(p: dict) -> DAG:
             "retries": 2,
             "retry_delay": timedelta(minutes=2),
             "on_failure_callback": _mark_failed,
+            "weight_rule": "upstream",   # finish in-flight loads before starting new ones
         },
         doc_md=__doc__,
     ) as dag:
 
-        @task
+        @task(pool=REDSHIFT_POOL)
         def begin(raw_keys: list[str] | None = None) -> dict:
             from etl import steps
             c = get_current_context()
@@ -95,6 +107,11 @@ def build_dag(p: dict) -> DAG:
         def parse(load: dict) -> dict:
             from etl import steps
             return steps.parse(_ctx(load)).to_dict()
+
+        @task(pool=REDSHIFT_POOL)
+        def record_parse(load: dict) -> dict:
+            from etl import steps
+            return steps.record_parse(_ctx(load)).to_dict()
 
         @task(pool=REDSHIFT_POOL)
         def load_tmp(load: dict) -> dict:
@@ -164,14 +181,14 @@ def build_dag(p: dict) -> DAG:
                 pending = s3_io.pending_files(landing)[:steps.MAX_FILES_PER_LOAD]
                 return PokeReturnValue(is_done=bool(pending), xcom_value=pending)
 
-            load = parse(begin(wait_for_file()))
+            load = record_parse(parse(begin(wait_for_file())))
         else:
             @task
             def extract_api(load: dict) -> dict:
                 from etl import steps
                 return steps.extract_api(_ctx(load)).to_dict()
 
-            load = parse(extract_api(begin()))
+            load = record_parse(parse(extract_api(begin())))
 
         # --- the product-level subflow (ibi: one flow per level) ---
         with TaskGroup(group_id=f"{level}_subflow"):

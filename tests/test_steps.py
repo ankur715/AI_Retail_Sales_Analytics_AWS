@@ -116,3 +116,36 @@ def test_pending_files_are_ordered_and_archive_moves_them_all(s3):
     moved = steps.archive(ctx)
     assert moved[0] == "dev/archive/C101/R202/LOAD1__R202_C101_20260912.xlsx"
     assert s3_io.pending_files("dev/landing/C101/R202/") == []
+
+
+def test_parse_does_not_touch_redshift_and_record_parse_writes_lineage(s3, sql):
+    from data_gen.generate import normalized_rows, render
+    from etl.weeks import week_range
+    p = {"pipeline_id": "C101_R201", "client_id": "C101", "retailer_id": "R201", "file_format": "csv"}
+    rows = normalized_rows("C101", "R201", "serial", week_range(date(2026, 8, 29), date(2026, 9, 26)), date(2026, 9, 26))
+    key = "dev/landing/C101/R201/R201_C101_20260926.csv"
+    s3_io.put_bytes(key, render(p, rows))
+    ctx = ctx_for("serial", pipeline_id="C101_R201", retailer_id="R201", file_format="csv")
+    ctx.raw_keys = [key]
+
+    steps.parse(ctx)
+    assert sql == []                                      # parse ran without a single Redshift statement
+    assert ctx.parsed_key.endswith("/output_C101_R201.csv") and len(ctx.file_stats) == 1
+
+    steps.record_parse(steps.LoadContext.from_dict(ctx.to_dict()))   # survives the XCom round trip
+    assert "UPDATE etl.load_audit" in sql[0][0] and "INSERT INTO etl.load_files" in sql[2][0]
+
+
+def test_fail_retries_serialization_conflicts(monkeypatch):
+    calls = []
+
+    def flaky(statements):
+        calls.append(1)
+        if len(calls) < 3:
+            raise Exception("ERROR: 1023 DETAIL: Serializable isolation violation on table - etl.load_audit")
+        return [1]
+
+    monkeypatch.setattr(steps.redshift, "run", flaky)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    steps.fail("LOAD1", "boom")
+    assert len(calls) == 3
