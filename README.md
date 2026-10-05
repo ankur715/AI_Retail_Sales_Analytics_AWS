@@ -12,9 +12,13 @@ hand-built flow per client/retailer, each with its own hard-coded parameters
 **metadata table** drives everything: one row per feed, and a DAG factory
 generates one DAG per row.
 
-The analytics chatbot over the fact table (natural language → SQL, like
-[Web_App](https://github.com/ankur715/Web_App)) is the next phase. The
-`fact.v_weekly_sales` view is already shaped for it.
+On top of the fact table, an **analytics chatbot** answers plain-English
+questions: it turns the question into SQL against curated views, runs it
+with a read-only user, and summarizes the result. It runs on **Claude via
+Amazon Bedrock** (as in
+[Member Engagement](https://github.com/ankur715/Member_Engagement_Pipeline_AWS))
+or **Gemini** (as in [Web_App](https://github.com/ankur715/Web_App)). See
+[Analytics chatbot](#analytics-chatbot).
 
 ## Architecture
 
@@ -247,6 +251,109 @@ schedule only upserts the rolling 5 weeks. Schema changes go through
 versioned, checksummed migrations (`sql/redshift/V*.sql`) applied to dev
 first. CI runs on `dev` and `main`.
 
+## Analytics chatbot
+
+<img src="pics/chatbot.jpg" alt="Chatbot answering two sales questions with data tables" width="460">
+
+*Local chatbot on Claude Haiku 4.5 (Bedrock): each answer shows its data,
+the SQL behind it (collapsed), the views used, and how current the data is.*
+
+A separate always-on FastAPI service (`chatbot/`). It isn't part of Airflow:
+the DAGs keep the data fresh, and the chatbot only reads curated views.
+
+```
+POST /api/chat {"message": "Top 5 products for Cobalt Outdoor in the last 4 weeks"}
+ 1. route      Gemini sees only a one-line summary of each view -> picks the views it needs
+ 2. write_sql  Gemini gets ONLY those views' columns, known values and examples -> one SELECT (JSON output)
+ 3. validate   sqlglot: one read-only statement, only the routed views, LIMIT <= 500
+ 4. run        as chat_reader (SELECT on chat.* only, 30 s timeout)
+               on a validation/SQL error: one repair round with the exact error
+ 5. summarize  the LLM answers from the returned rows only, given the SQL that produced them
+               (its WHERE filters aren't repeated in the result columns), with "data through ..."
+-> {answer, sql, views, columns, rows, data_as_of}
+```
+
+**Metadata limits what each question can see.** `config/chat_catalog.yaml`
+describes each curated view: a summary for routing, the grain, column
+meanings, which columns' distinct values to show, and example
+question → SQL pairs. Business rules (Saturday weeks, `weeks_ago`, never
+summing inventory across weeks) are written there once.
+- **Each question only sees what it needs:** the SQL step receives the
+  metadata of the routed views only, so prompts stay small.
+- **The validator enforces it:** queries may use only those views. A query
+  against an un-routed view, `fact.*` or `etl.*` is rejected and repaired
+  before it reaches Redshift.
+- **Separate from pipeline metadata:** `pipeline_config.csv` says how to
+  *load* a feed; `chat_catalog.yaml` says how to *ask about* the data.
+  Onboarding a new feed needs no chatbot change.
+
+| Curated view (`sql/redshift/V010__chat_views.sql`) | Grain | For |
+|---|---|---|
+| `chat.v_sales_by_week` | week × brand × retailer × category | Totals, trends, comparisons, week-over-week |
+| `chat.v_weekly_sales` | week × brand × retailer × product | Products, styles, colors, sizes, top-N, stockouts |
+| `chat.v_calendar` | week | Named months/quarters; `weeks_ago` (0 = latest loaded week) |
+| `chat.v_data_freshness` | brand × retailer | "How current is the data?" |
+
+**Guardrails:**
+- **Database access:** `chat_reader` (`python -m chatbot.setup_reader`) can
+  read only the chat schema. It has USAGE on fact/dim/etl so views resolve,
+  but no SELECT on any table there. Verified: `SELECT * FROM fact.fact_sales`
+  → *permission denied*.
+- **Query safety:** sqlglot parses the SQL rather than keyword-matching it
+  (Web_App's check would reject a column named `updated_at`). Results are
+  capped at 500 rows, with a 30 s timeout.
+- **Load and cost:** repeated questions are cached for 15 minutes, so they
+  don't call Gemini or wake Redshift.
+- **Gemini errors:**
+  - overload (503) and per-minute limits (429): retried with backoff,
+    honouring Gemini's `retryDelay`
+  - a daily quota: fails fast with a clear message instead of retrying
+- **Off-topic questions** route to no view and get a polite refusal; no SQL
+  runs.
+
+**Two LLM providers, one set of prompts.** `LLM_PROVIDER` picks which one
+answers; `chatbot/llm.py` holds the prompts, and each provider module only
+makes the calls:
+
+| | `bedrock` (local default in `.env`) | `gemini` |
+|---|---|---|
+| Model | Claude through Amazon Bedrock (`anthropic` SDK). Code default `claude-opus-5-5`; this account can call **Claude Haiku 4.5** via its inference profile, so `.env` sets `BEDROCK_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0`, `LLM_BEDROCK_ENDPOINT=runtime` | `GEMINI_MODEL` (default `gemini-3.6-flash`, as in Web_App) |
+| Credentials | The AWS profile (`retail-pipeline`). Terraform's `chatbot-bedrock-invoke` policy allows only the listed models | `GOOGLE_API_KEY` |
+| Structured output | `messages.parse(output_format=<Pydantic model>)` | `response_schema` |
+| Limits and cost | Pay per token: a question is 3 short calls, about a cent with Haiku. No daily cap | Free tier: **about 20 requests per model per day**, so roughly 6 new questions a day |
+| Errors → 503 with a clear message | Throttling and 5xx after the SDK's retries; IAM or model-access problems reported as configuration; refusals reported as declined | 503 overload and per-minute 429 retried, honouring `retryDelay`; a daily quota fails fast |
+
+Gemini was the first provider. Testing used up its free daily quota within
+a few questions, which is why the local setup switched to Bedrock, the same
+way the Member Engagement project calls Claude.
+
+```bash
+RETAIL_ENV=dev .venv/bin/python -m etl.migrate          # creates the chat views (V010)
+RETAIL_ENV=dev .venv/bin/python -m chatbot.setup_reader # read-only user (CHAT_REDSHIFT_PASSWORD in .env)
+.venv/bin/uvicorn chatbot.app:app --port 8000           # http://localhost:8000
+```
+
+**Verified live** in dev, on Bedrock with Claude Haiku 4.5. The questions
+were routed to the right views and produced correct SQL, a few seconds
+each:
+
+| Question | Routed to | Answer (abridged) |
+|---|---|---|
+| Total sales by retailer last week | `v_sales_by_week` | Northgate $27,157.60 (only Northgate has reported the latest week, Oct 17) |
+| Aurora Apparel at Summit Outfitters, last 4 vs prior 4 weeks | `v_sales_by_week` | $211,111.78 vs $303,999.18, down $92,887.40 |
+| Top 5 products for Cobalt Outdoor, last 4 weeks | `v_weekly_sales` | Daypack $98,781.12, Fleece Vest, Rain Shell, Trek Pant, Beanie (all at Harbor Mart) |
+| Sales by month for Bramble Footwear | `v_sales_by_week` + `v_calendar` | Jul–Oct by month, noting October is partial |
+| Which products are out of stock this week? | `v_weekly_sales` | None |
+| How current is the data for Harbor Mart? | `v_data_freshness` | Through Oct 3, two weeks behind the latest week loaded |
+| What is the weather in Paris? | — | Polite refusal; no SQL run |
+
+The first live run caught a real issue: two answers second-guessed
+correctly filtered rows. For example, it said the products were "Harbor
+Mart, not Cobalt Outdoor", because the result columns didn't repeat the
+`brand = 'Cobalt Outdoor'` filter. The summary step now receives the SQL as
+well. On Gemini, one question answered end to end before the free-tier
+quota ran out.
+
 ## Dummy data
 
 3 clients (Aurora Apparel, Bramble Footwear, Cobalt Outdoor) × 3 retailers.
@@ -266,6 +373,10 @@ show.
 ## Setup
 
 ```bash
+# 0. Get the code
+git clone https://github.com/ankur715/Retail_Sales_Analytics_AWS.git
+cd Retail_Sales_Analytics_AWS
+
 # 1. Infrastructure (S3, Redshift Serverless, IAM) -- ~5 min
 cd infra/terraform
 cp terraform.tfvars.example terraform.tfvars          # your IP, a Redshift password
@@ -295,6 +406,29 @@ RETAIL_ENV=prod .venv/bin/python -m etl.migrate && RETAIL_ENV=prod .venv/bin/pyt
 airflow/start_airflow.sh
 ```
 
+### Run it locally
+
+Each service runs in its own terminal, from the project root:
+
+| Service | Command | Open |
+|---|---|---|
+| Airflow (dev) | `airflow/start_airflow.sh` | http://localhost:8080 (user `admin`; password in `airflow/airflow_home/dev/simple_auth_manager_passwords.json.generated`) |
+| Mock retailer API (needed by the C102 @ R202 API feed) | `.venv/bin/uvicorn mock_api.main:app --port 9100` | http://localhost:9100/docs (endpoints; `/v1/sales` needs `Bearer local-dev-token`) |
+| Analytics chatbot | `.venv/bin/uvicorn chatbot.app:app --port 8000` | http://localhost:8000 |
+
+```bash
+airflow/start_airflow.sh                                  # 1. orchestration
+.venv/bin/uvicorn mock_api.main:app --port 9100           # 2. retailer API (API feeds fail without it)
+.venv/bin/uvicorn chatbot.app:app --port 8000             # 3. chatbot (LLM_PROVIDER in .env)
+```
+
+Stop a service with Ctrl+C in its terminal. Stopping Airflow leaves its
+child processes running, so stop them too (from the project root):
+
+```bash
+pkill -f "$(pwd)/.venv/bin/airflow"
+```
+
 To run one pipeline from the CLI without Airflow (same steps as its DAG):
 
 ```bash
@@ -305,7 +439,7 @@ To run one pipeline from the CLI without Airflow (same steps as its DAG):
 ## Tests
 
 ```bash
-.venv/bin/pytest -q tests                  # 46 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging
+.venv/bin/pytest -q tests                  # 75 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging, chatbot (routing, SQL guard, repair, cache, both LLM providers and their errors)
 cd airflow && ../.venv/bin/pytest -q tests # 12 DAG integrity tests: one DAG per pipeline, subflow shape, reconcile gates the merge, every Redshift writer pooled, priority order
 ```
 
@@ -314,7 +448,7 @@ CI (`.github/workflows/ci.yml`) runs both suites plus `terraform fmt` and
 
 ## Verified on live AWS
 
-`terraform apply` created all 15 resources. Migrations V001–V009 applied to
+`terraform apply` created all 16 resources (the 16th is the chatbot's Bedrock policy). Migrations V001–V010 applied to
 both `retail_dev` and `retail_prod`. Then all 9 dev pipelines loaded 12
 weeks of history and one weekly drop, through the CLI and through Airflow,
 including the API feed: **22 loads, all reconciled (src = stg + rej), 9 pairs ×
@@ -363,6 +497,8 @@ airflow/dags/                  DAG factory + metadata sync DAG
 airflow/start_airflow.sh       local Airflow per environment
 data_gen/                      synthetic catalog + retailer file layouts
 mock_api/                      FastAPI retailer API (bearer token, cursor paging)
+chatbot/                       analytics chatbot: routing, SQL guard, read-only DB access, Bedrock/Gemini providers, FastAPI + chat page
+config/chat_catalog.yaml       chatbot metadata: curated views, columns, known values, examples
 infra/terraform/               S3, IAM (COPY role + pipeline user), Redshift Serverless, usage limit
 tests/, airflow/tests/         unit + DAG integrity tests
 ```

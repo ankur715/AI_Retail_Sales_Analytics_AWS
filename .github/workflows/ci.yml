@@ -15,7 +15,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Unit tests (no AWS -- S3 is moto, Redshift calls are recorded, the API is a TestClient)
+      - name: Unit tests (no AWS, no Gemini -- S3 is moto, Redshift and Gemini calls are faked, APIs use TestClient)
         run: pytest -q tests
 
   dag-tests:

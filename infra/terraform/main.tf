@@ -246,3 +246,29 @@ resource "aws_redshiftserverless_usage_limit" "daily_compute" {
   period        = "daily"
   breach_action = "deactivate" # stop serving queries rather than keep billing
 }
+
+# ---------------------------------------------------------------------------
+# Chatbot LLM on Amazon Bedrock: the pipeline user (which the local chatbot
+# runs as) may invoke only the listed Claude inference profiles and the
+# foundation models they route to -- nothing else in Bedrock.
+# ---------------------------------------------------------------------------
+
+resource "aws_iam_user_policy" "chatbot_bedrock" {
+  name = "chatbot-bedrock-invoke"
+  user = aws_iam_user.pipeline.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+      Resource = flatten([
+        for model in var.chatbot_bedrock_models : [
+          # the cross-region inference profile in this account...
+          "arn:aws:bedrock:${var.region}:${data.aws_caller_identity.current.account_id}:inference-profile/us.${model}",
+          # ...and the foundation model in each US region the profile routes to
+          "arn:aws:bedrock:*::foundation-model/${model}",
+        ]
+      ])
+    }]
+  })
+}

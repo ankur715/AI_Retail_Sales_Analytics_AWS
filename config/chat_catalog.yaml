@@ -1,0 +1,96 @@
+# Chatbot metadata: the curated views the chatbot may query (sql/redshift/
+# V010__chat_views.sql). Reviewed in PRs like config/pipeline_config.csv.
+#
+# Per question the chatbot sends Gemini only the `summary` of every view to
+# pick the ones it needs (routing), then only the selected views' columns,
+# known values and examples to write the SQL. The SQL validator then allows
+# exactly those views -- a question can't reach anything it wasn't routed to.
+
+business_rules:
+  - "Weeks end on Saturday. week_ending is the Saturday that closes the week."
+  - "weeks_ago = 0 is the LATEST week loaded (not today). 'Last week' means weeks_ago = 0; 'last 4 weeks' means weeks_ago BETWEEN 0 AND 3; 'the 4 weeks before that' means weeks_ago BETWEEN 4 AND 7."
+  - "sales_usd is net sales in US dollars for the week. inventory_units is units on hand at week end (a snapshot: never SUM inventory across weeks; use the latest week or an average)."
+  - "brand is the client (the company whose products are sold); retailer is the store chain that reports the data."
+  - "Each retailer reports at one product grain: Harbor Mart reports style-level products (no color/size); the others report SKUs (style + color + size)."
+  - "Only mapped products are included; rejected/unmapped source rows are not in these views."
+  - "Match brand, retailer and category values exactly as listed under known values."
+
+views:
+  chat.v_sales_by_week:
+    summary: "Weekly totals per brand x retailer x category: sales, inventory, product counts, out-of-stock counts, week-over-week change. Use for totals, trends, comparisons between brands/retailers/periods."
+    grain: "one row per week_ending x brand x retailer x category"
+    columns:
+      week_ending: "DATE, Saturday that ends the week"
+      weeks_ago: "INT, 0 = latest loaded week"
+      brand: "TEXT, client brand name"
+      retailer: "TEXT, retailer name"
+      category: "TEXT, product category (one per brand)"
+      sales_usd: "DECIMAL, total net sales in USD"
+      inventory_units: "INT, total units on hand at week end"
+      products_reported: "INT, products with a row that week"
+      products_out_of_stock: "INT, products with 0 units on hand"
+      prev_week_sales_usd: "DECIMAL, same brand x retailer previous week's sales"
+      wow_change_usd: "DECIMAL, sales_usd - prev_week_sales_usd"
+      wow_change_pct: "DECIMAL, week-over-week % change (NULL if no previous week)"
+    known_values: [brand, retailer, category]
+    examples:
+      - question: "Total sales by retailer last week"
+        sql: "SELECT retailer, SUM(sales_usd) AS sales_usd FROM chat.v_sales_by_week WHERE weeks_ago = 0 GROUP BY retailer ORDER BY sales_usd DESC"
+      - question: "How did Aurora Apparel do at Summit Outfitters over the last 4 weeks vs the 4 weeks before?"
+        sql: "SELECT SUM(CASE WHEN weeks_ago BETWEEN 0 AND 3 THEN sales_usd END) AS last_4_weeks_usd, SUM(CASE WHEN weeks_ago BETWEEN 4 AND 7 THEN sales_usd END) AS prior_4_weeks_usd FROM chat.v_sales_by_week WHERE brand = 'Aurora Apparel' AND retailer = 'Summit Outfitters' AND weeks_ago BETWEEN 0 AND 7"
+
+  chat.v_weekly_sales:
+    summary: "Product-level weekly detail per brand x retailer x product (name, style, color, size): sales, inventory, out-of-stock flag. Use for questions about specific products, styles, colors, sizes, top/bottom products, or stockouts."
+    grain: "one row per week_ending x brand x retailer x product"
+    columns:
+      week_ending: "DATE, Saturday that ends the week"
+      weeks_ago: "INT, 0 = latest loaded week"
+      brand: "TEXT, client brand name"
+      retailer: "TEXT, retailer name"
+      category: "TEXT, product category"
+      product_id: "TEXT, internal product id"
+      product_name: "TEXT, e.g. 'Rain Shell BLK M' (SKU) or 'Rain Shell' (style)"
+      product_grain: "TEXT, 'sku' or 'style'"
+      style: "TEXT, style code S01..S05"
+      color: "TEXT, BLK or NVY; NULL for style-grain products"
+      size: "TEXT, M or L; NULL for style-grain products"
+      sales_usd: "DECIMAL, net sales in USD"
+      inventory_units: "INT, units on hand at week end"
+      is_out_of_stock: "BOOLEAN, inventory_units = 0"
+    known_values: [brand, retailer, category, color, size]
+    examples:
+      - question: "Top 5 products by sales for Cobalt Outdoor in the last 4 weeks"
+        sql: "SELECT product_name, retailer, SUM(sales_usd) AS sales_usd FROM chat.v_weekly_sales WHERE brand = 'Cobalt Outdoor' AND weeks_ago BETWEEN 0 AND 3 GROUP BY product_name, retailer ORDER BY sales_usd DESC LIMIT 5"
+      - question: "Which products are out of stock this week?"
+        sql: "SELECT brand, retailer, product_name FROM chat.v_weekly_sales WHERE weeks_ago = 0 AND is_out_of_stock ORDER BY brand, retailer, product_name"
+
+  chat.v_calendar:
+    summary: "Calendar of loaded weeks: week start/end dates, year, quarter, month, weeks_ago. Use to resolve named periods (a month, quarter, specific dates) or to list which weeks exist."
+    grain: "one row per week_ending"
+    columns:
+      week_ending: "DATE, Saturday that ends the week"
+      week_starting: "DATE, the Sunday that starts the week"
+      year: "INT"
+      quarter: "INT, 1-4"
+      month: "INT, 1-12"
+      month_name: "TEXT, e.g. 'Sep 2026'"
+      weeks_ago: "INT, 0 = latest loaded week"
+    known_values: [month_name]
+    examples:
+      - question: "Sales by month for Bramble Footwear"
+        sql: "SELECT c.month_name, SUM(s.sales_usd) AS sales_usd FROM chat.v_sales_by_week s JOIN chat.v_calendar c ON c.week_ending = s.week_ending WHERE s.brand = 'Bramble Footwear' GROUP BY c.year, c.month, c.month_name ORDER BY c.year, c.month"
+
+  chat.v_data_freshness:
+    summary: "Data coverage per brand x retailer: first and latest week loaded, number of weeks, last successful load time. Use for 'how current is the data', 'what data do you have', coverage questions."
+    grain: "one row per brand x retailer"
+    columns:
+      brand: "TEXT, client brand name"
+      retailer: "TEXT, retailer name"
+      first_week_loaded: "DATE"
+      latest_week_loaded: "DATE"
+      weeks_loaded: "INT"
+      last_successful_load_at: "TIMESTAMP, UTC"
+    known_values: [brand, retailer]
+    examples:
+      - question: "How current is the data for Harbor Mart?"
+        sql: "SELECT brand, latest_week_loaded, last_successful_load_at FROM chat.v_data_freshness WHERE retailer = 'Harbor Mart' ORDER BY brand"
