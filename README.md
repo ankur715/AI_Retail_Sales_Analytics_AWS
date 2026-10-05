@@ -253,6 +253,11 @@ first. CI runs on `dev` and `main`.
 
 ## Analytics chatbot
 
+<img src="pics/chatbot.jpg" alt="Chatbot answering two sales questions with data tables" width="460">
+
+*Local chatbot on Claude Haiku 4.5 (Bedrock): each answer shows its data,
+the SQL behind it (collapsed), the views used, and how current the data is.*
+
 A separate always-on FastAPI service (`chatbot/`). It isn't part of Airflow:
 the DAGs keep the data fresh, and the chatbot only reads curated views.
 
@@ -395,6 +400,29 @@ RETAIL_ENV=prod .venv/bin/python -m etl.migrate && RETAIL_ENV=prod .venv/bin/pyt
 # 6. Airflow -> http://localhost:8080
 .venv/bin/python -c "from etl import metadata; metadata.sync_snapshot()"
 airflow/start_airflow.sh
+```
+
+### Run it locally
+
+Each service runs in its own terminal, from the project root:
+
+| Service | Command | Open |
+|---|---|---|
+| Airflow (dev) | `airflow/start_airflow.sh` | http://localhost:8080 (user `admin`; password in `airflow/airflow_home/dev/simple_auth_manager_passwords.json.generated`) |
+| Mock retailer API (needed by the C102 @ R202 API feed) | `.venv/bin/uvicorn mock_api.main:app --port 9100` | http://localhost:9100/docs (endpoints; `/v1/sales` needs `Bearer local-dev-token`) |
+| Analytics chatbot | `.venv/bin/uvicorn chatbot.app:app --port 8000` | http://localhost:8000 |
+
+```bash
+airflow/start_airflow.sh                                  # 1. orchestration
+.venv/bin/uvicorn mock_api.main:app --port 9100           # 2. retailer API (API feeds fail without it)
+.venv/bin/uvicorn chatbot.app:app --port 8000             # 3. chatbot (LLM_PROVIDER in .env)
+```
+
+Stop a service with Ctrl+C in its terminal. Stopping Airflow leaves its
+child processes running, so stop them too:
+
+```bash
+pkill -f "Retail_Sales_Analytics_Chatbot/.venv/bin/airflow"
 ```
 
 To run one pipeline from the CLI without Airflow (same steps as its DAG):
