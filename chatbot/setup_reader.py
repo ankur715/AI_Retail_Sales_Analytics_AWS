@@ -13,8 +13,9 @@ USAGE alone only lets it *refer* to objects there -- it still has no SELECT
 on any fact/dim/etl table, so `SELECT * FROM fact.fact_sales` is refused.
 """
 
-UNDERLYING_SCHEMAS = ("fact", "dim", "etl")
 from etl import config, redshift
+
+UNDERLYING_SCHEMAS = ("fact", "dim", "etl")
 
 
 def main() -> None:
