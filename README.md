@@ -328,10 +328,6 @@ a few questions, which is why the local setup switched to Bedrock, the same
 way the Member Engagement project calls Claude.
 
 ```bash
-# 0. Get the code
-git clone https://github.com/ankur715/Retail_Sales_Analytics_AWS.git
-cd Retail_Sales_Analytics_AWS
-
 RETAIL_ENV=dev .venv/bin/python -m etl.migrate          # creates the chat views (V010)
 RETAIL_ENV=dev .venv/bin/python -m chatbot.setup_reader # read-only user (CHAT_REDSHIFT_PASSWORD in .env)
 .venv/bin/uvicorn chatbot.app:app --port 8000           # http://localhost:8000
@@ -377,6 +373,10 @@ show.
 ## Setup
 
 ```bash
+# 0. Get the code
+git clone https://github.com/ankur715/Retail_Sales_Analytics_AWS.git
+cd Retail_Sales_Analytics_AWS
+
 # 1. Infrastructure (S3, Redshift Serverless, IAM) -- ~5 min
 cd infra/terraform
 cp terraform.tfvars.example terraform.tfvars          # your IP, a Redshift password
