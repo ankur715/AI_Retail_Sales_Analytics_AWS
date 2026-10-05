@@ -47,13 +47,19 @@ class ChatResponse(BaseModel):
     error: str | None = None
 
 
+MESSAGES = {
+    "busy": "The language model is busy right now -- please try again in a minute.",
+    "quota": "The language model's daily quota is used up -- try again tomorrow.",
+    "config": "The language model isn't configured correctly on the server.",
+    "declined": "The language model declined to answer that question.",
+}
+
+
 @app.exception_handler(llm.LLMUnavailable)
 def llm_unavailable(request: Request, exc: llm.LLMUnavailable):
-    # Gemini overloaded / rate-limited after retries: a clear, retryable answer instead of a 500
-    daily = "daily quota" in str(exc)
-    detail = ("The language model's daily quota is used up -- try again tomorrow." if daily
-              else "The language model is busy right now -- please try again in a minute.")
-    return JSONResponse(status_code=503, content={"detail": detail, "reason": str(exc)})
+    # A clear, retryable answer instead of a 500; `reason` carries the detail for the operator
+    return JSONResponse(status_code=503, content={"detail": MESSAGES.get(exc.kind, MESSAGES["busy"]),
+                                                  "reason": str(exc)})
 
 
 @app.get("/")
@@ -63,8 +69,8 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "env": config.ENV, "database": config.REDSHIFT_DB, "model": config.GEMINI_MODEL,
-            "llm_configured": bool(config.GOOGLE_API_KEY), "views": catalog.view_names()}
+    return {"status": "ok", "env": config.ENV, "database": config.REDSHIFT_DB, "provider": config.LLM_PROVIDER,
+            "model": llm.model_name(), "llm_configured": llm.configured(), "views": catalog.view_names()}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -74,8 +80,8 @@ def chat(req: ChatRequest) -> ChatResponse:
     hit = _cache.get(key)
     if hit and time.monotonic() - hit[0] < CACHE_TTL:
         return ChatResponse(**hit[1], cached=True)
-    if not config.GOOGLE_API_KEY:
-        raise HTTPException(503, "GOOGLE_API_KEY is not configured on the server")
+    if not llm.configured():
+        raise HTTPException(503, f"The {config.LLM_PROVIDER} LLM is not configured on the server")
 
     # 1. route: only the views this question needs
     route = llm.route(question)
@@ -105,7 +111,7 @@ def chat(req: ChatRequest) -> ChatResponse:
 
     # 5. answer from the rows only
     as_of = db.data_as_of()
-    answer = llm.summarize(question, result["columns"], result["rows"], as_of)
+    answer = llm.summarize(question, sql, result["columns"], result["rows"], as_of)
     payload = dict(question=question, answer=answer, views=route.views, sql=sql, explanation=plan.explanation,
                    columns=result["columns"], rows=result["rows"], row_count=result["row_count"], data_as_of=as_of)
     _cache[key] = (time.monotonic(), payload)

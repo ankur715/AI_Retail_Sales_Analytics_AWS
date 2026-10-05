@@ -6,8 +6,9 @@ psycopg2-binary>=2.9
 python-dotenv>=1.0
 requests>=2.32
 
-# analytics chatbot (chatbot/): Gemini, SQL validation, catalog
+# analytics chatbot (chatbot/): LLM providers (Gemini, Claude on Bedrock), SQL validation, catalog
 google-genai>=1.20
+anthropic[bedrock]>=1.8
 sqlglot>=25
 pyyaml>=6
 

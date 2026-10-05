@@ -47,3 +47,9 @@ variable "redshift_daily_rpu_hours" {
   type        = number
   default     = 3
 }
+
+variable "chatbot_bedrock_models" {
+  description = "Bedrock model ids the chatbot may invoke through us.* inference profiles."
+  type        = list(string)
+  default     = ["anthropic.claude-haiku-4-5-20251001-v1:0"]
+}

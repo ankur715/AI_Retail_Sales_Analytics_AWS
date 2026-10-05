@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from chatbot import app as chat_app
-from chatbot import catalog, guard, llm
+from chatbot import catalog, guard, llm, llm_bedrock, llm_gemini
 
 VIEWS_SQL = (Path(__file__).resolve().parent.parent / "sql" / "redshift" / "V010__chat_views.sql").read_text()
 
@@ -84,7 +84,7 @@ def fakes(monkeypatch):
     monkeypatch.setattr(chat_app.config, "GOOGLE_API_KEY", "test-key")
     monkeypatch.setattr(chat_app, "_cache", {})
     monkeypatch.setattr(llm, "route", lambda q: llm.Route(views=["chat.v_sales_by_week"], reason="totals"))
-    monkeypatch.setattr(llm, "summarize", lambda q, cols, rows, as_of: f"{len(rows)} rows through {as_of}")
+    monkeypatch.setattr(llm, "summarize", lambda q, sql, cols, rows, as_of: f"{len(rows)} rows through {as_of}")
     monkeypatch.setattr(chat_app.db, "known_values", lambda cols: {"chat.v_sales_by_week.retailer": ["Harbor Mart"]})
     monkeypatch.setattr(chat_app.db, "data_as_of", lambda: "2026-10-17")
 
@@ -161,13 +161,13 @@ def test_gemini_overload_retries_then_returns_clear_503(monkeypatch):
                 raise errors.ServerError(503, {"error": {"code": 503, "status": "UNAVAILABLE",
                                                          "message": "high demand"}})
 
-    monkeypatch.setattr(llm, "client", lambda: Busy)
-    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(llm_gemini, "client", lambda: Busy)
+    monkeypatch.setattr(llm_gemini.time, "sleep", lambda s: None)
     monkeypatch.setattr(chat_app.config, "GOOGLE_API_KEY", "test-key")
     monkeypatch.setattr(chat_app, "_cache", {})
     r = TestClient(chat_app.app).post("/api/chat", json={"message": "Total sales last week"})
     assert r.status_code == 503 and "busy" in r.json()["detail"]
-    assert len(attempts) == len(llm.RETRY_DELAYS) + 1
+    assert len(attempts) == len(llm_gemini.RETRY_DELAYS) + 1
 
 
 def test_daily_quota_fails_fast_without_retrying(monkeypatch):
@@ -184,9 +184,87 @@ def test_daily_quota_fails_fast_without_retrying(monkeypatch):
                     "details": [{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},
                                 {"retryDelay": "23517s"}]}})
 
-    monkeypatch.setattr(llm, "client", lambda: OutOfQuota)
-    monkeypatch.setattr(llm.time, "sleep", lambda s: pytest.fail("must not sleep on a daily quota"))
+    monkeypatch.setattr(llm_gemini, "client", lambda: OutOfQuota)
+    monkeypatch.setattr(llm_gemini.time, "sleep", lambda s: pytest.fail("must not sleep on a daily quota"))
     monkeypatch.setattr(chat_app.config, "GOOGLE_API_KEY", "test-key")
     monkeypatch.setattr(chat_app, "_cache", {})
     r = TestClient(chat_app.app).post("/api/chat", json={"message": "Total sales last week"})
     assert r.status_code == 503 and "daily quota" in r.json()["detail"] and len(attempts) == 1
+
+
+
+# ---------------------------------------------------------------------------
+# Bedrock provider (Claude via the anthropic SDK) -- faked client, no AWS
+# ---------------------------------------------------------------------------
+class FakeMessages:
+    def __init__(self, parsed=None, text="", stop_reason="end_turn", error=None):
+        self.parsed, self.text, self.stop_reason, self.error, self.calls = parsed, text, stop_reason, error, []
+
+    def _respond(self, **kwargs):
+        from types import SimpleNamespace
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return SimpleNamespace(stop_reason=self.stop_reason, parsed_output=self.parsed,
+                               content=[SimpleNamespace(type="text", text=self.text)])
+
+    def parse(self, **kwargs):
+        return self._respond(**kwargs)
+
+    def create(self, **kwargs):
+        return self._respond(**kwargs)
+
+
+@pytest.fixture
+def bedrock(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(llm.config, "LLM_PROVIDER", "bedrock")
+    fake = FakeMessages()
+    monkeypatch.setattr(llm_bedrock, "client", lambda: SimpleNamespace(messages=fake))
+    return fake
+
+
+def test_bedrock_structured_call_uses_parse_with_the_schema(bedrock):
+    bedrock.parsed = llm.Route(views=["chat.v_sales_by_week"], reason="totals")
+    route = llm.route("Total sales by retailer last week")
+    assert route.views == ["chat.v_sales_by_week"]
+    call = bedrock.calls[0]
+    assert call["output_format"] is llm.Route and call["model"] == "anthropic.claude-opus-5-5"
+
+
+def test_bedrock_model_id_rules(monkeypatch):
+    monkeypatch.setattr(llm_bedrock.config, "BEDROCK_MODEL", "claude-opus-5-5")
+    assert llm_bedrock.model_name() == "anthropic.claude-opus-5-5"                 # bare id gets the prefix
+    monkeypatch.setattr(llm_bedrock.config, "BEDROCK_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+    assert llm_bedrock.model_name() == "us.anthropic.claude-haiku-4-5-20251001-v1:0"   # profiles verbatim
+
+
+def test_bedrock_summary_joins_text_blocks(bedrock):
+    bedrock.text = "Northgate sold $27,157.60."
+    assert llm.summarize("q", "SELECT retailer FROM chat.v_sales_by_week", ["retailer"], [["Northgate"]],
+                         "2026-10-17") == "Northgate sold $27,157.60."
+    assert "SELECT retailer FROM chat.v_sales_by_week" in bedrock.calls[0]["messages"][0]["content"]
+
+
+def test_bedrock_refusal_becomes_declined(bedrock):
+    bedrock.stop_reason = "refusal"
+    with pytest.raises(llm.LLMUnavailable) as exc:
+        llm.route("anything")
+    assert exc.value.kind == "declined"
+
+
+def test_bedrock_permission_error_is_a_config_problem_and_a_clear_503(bedrock, monkeypatch):
+    import anthropic
+    import httpx2
+    response = httpx2.Response(403, request=httpx2.Request("POST", "https://bedrock.example"))
+    bedrock.error = anthropic.PermissionDeniedError("no model access", response=response, body=None)
+    monkeypatch.setattr(chat_app, "_cache", {})
+    r = TestClient(chat_app.app).post("/api/chat", json={"message": "Total sales last week"})
+    assert r.status_code == 503 and "isn't configured" in r.json()["detail"]
+    assert "model access" in r.json()["reason"]
+
+
+def test_unknown_provider_is_rejected(monkeypatch):
+    monkeypatch.setattr(llm.config, "LLM_PROVIDER", "openai")
+    with pytest.raises(llm.LLMUnavailable, match="LLM_PROVIDER must be one of"):
+        llm.provider()

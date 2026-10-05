@@ -6,6 +6,12 @@ from pathlib import Path
 # before etl.config is imported anywhere.
 os.environ.update({
     "RETAIL_ENV": "dev",
+    # chatbot: deterministic provider, no real keys (a developer's .env may say bedrock / hold a key)
+    "LLM_PROVIDER": "gemini",
+    "GOOGLE_API_KEY": "",
+    "GEMINI_MODEL": "gemini-test",
+    "BEDROCK_MODEL": "claude-opus-5-5",
+    "LLM_BEDROCK_ENDPOINT": "mantle",
     "S3_BUCKET": "test-retail-lake",
     "AWS_ACCESS_KEY_ID": "testing",
     "AWS_SECRET_ACCESS_KEY": "testing",
