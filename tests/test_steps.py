@@ -22,6 +22,7 @@ def sql(monkeypatch):
         return [1] * len(statements)
 
     monkeypatch.setattr(steps.redshift, "run", fake_run)
+    monkeypatch.setattr(steps.redshift, "fetch_all", lambda sql, params=None: [(0,)])   # e.g. load_tmp's row count
     return calls
 
 
