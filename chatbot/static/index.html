@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retail Sales Chatbot</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5d6677; --border: #dfe3ea;
+    --accent: #2f5bea; --accent-text: #ffffff; --user: #e8eefd; --code: #f1f3f7; --err: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b2029; --text: #e6e9ef; --muted: #9aa3b2; --border: #2c3340;
+      --accent: #6d8cff; --accent-text: #0d1220; --user: #22304f; --code: #232a35; --err: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 140px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  .chip { border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 16px;
+          padding: 6px 12px; font-size: 13px; cursor: pointer; }
+  .chip:hover { border-color: var(--accent); }
+  .msg { margin: 14px 0; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border);
+         background: var(--panel); }
+  .msg.user { background: var(--user); border-color: transparent; margin-left: 15%; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .err { color: var(--err); }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: auto; font-size: 12.5px;
+        white-space: pre-wrap; }
+  .table-wrap { overflow-x: auto; margin-top: 8px; max-height: 320px; }
+  table { border-collapse: collapse; font-size: 13px; width: 100%; }
+  th, td { border-bottom: 1px solid var(--border); padding: 5px 8px; text-align: left; white-space: nowrap; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  form { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg); border-top: 1px solid var(--border);
+         padding: 12px 16px; }
+  .bar { max-width: 860px; margin: 0 auto; display: flex; gap: 8px; }
+  input { flex: 1; min-width: 0; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border);
+          background: var(--panel); color: var(--text); font-size: 15px; }
+  button[type=submit] { padding: 0 18px; border: 0; border-radius: 8px; background: var(--accent);
+                        color: var(--accent-text); font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Retail Sales Chatbot</h1>
+  <div class="sub" id="status">Ask about weekly sales and inventory by brand, retailer and product.</div>
+  <div class="chips" id="chips"></div>
+  <div id="log"></div>
+</main>
+<form id="form">
+  <div class="bar">
+    <input id="q" placeholder="e.g. Total sales by retailer last week" autocomplete="off" maxlength="500">
+    <button type="submit" id="send">Ask</button>
+  </div>
+</form>
+<script>
+const examples = [
+  "Total sales by retailer last week",
+  "How did Aurora Apparel do at Summit Outfitters over the last 4 weeks vs the 4 weeks before?",
+  "Top 5 products by sales for Cobalt Outdoor in the last 4 weeks",
+  "Which products are out of stock this week?",
+  "How current is the data for Harbor Mart?",
+];
+const log = document.getElementById("log"), q = document.getElementById("q"), send = document.getElementById("send");
+
+for (const text of examples) {
+  const b = document.createElement("button");
+  b.className = "chip"; b.type = "button"; b.textContent = text;
+  b.onclick = () => ask(text);
+  document.getElementById("chips").append(b);
+}
+
+fetch("/api/health").then(r => r.json()).then(h => {
+  document.getElementById("status").textContent =
+    `${h.env} · ${h.database} · ${h.model}${h.llm_configured ? "" : " · GOOGLE_API_KEY missing"}`;
+}).catch(() => {});
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function table(columns, rows) {
+  const wrap = el("div", "table-wrap"), t = el("table"), head = el("tr");
+  columns.forEach(c => head.append(el("th", "", c)));
+  t.append(head);
+  rows.forEach(r => {
+    const tr = el("tr");
+    r.forEach(v => {
+      const isNum = typeof v === "number";
+      tr.append(el("td", isNum ? "num" : "", v === null ? "" :
+        isNum ? v.toLocaleString(undefined, {maximumFractionDigits: 2}) : String(v)));
+    });
+    t.append(tr);
+  });
+  wrap.append(t);
+  return wrap;
+}
+
+async function ask(text) {
+  text = text.trim();
+  if (!text) return;
+  log.append(el("div", "msg user", text));
+  const reply = el("div", "msg", "Thinking…");
+  log.append(reply);
+  q.value = ""; send.disabled = true;
+  reply.scrollIntoView({behavior: "smooth", block: "end"});
+  try {
+    const res = await fetch("/api/chat", {method: "POST", headers: {"Content-Type": "application/json"},
+                                           body: JSON.stringify({message: text})});
+    const d = await res.json();
+    reply.textContent = "";
+    if (!res.ok) { reply.append(el("div", "err", d.detail || `Error ${res.status}`)); return; }
+    reply.append(el("div", d.error ? "err" : "", d.answer));
+    if (d.rows && d.rows.length) {
+      const det = el("details"); det.open = d.rows.length <= 12;
+      det.append(el("summary", "", `Data (${d.row_count} row${d.row_count === 1 ? "" : "s"})`), table(d.columns, d.rows));
+      reply.append(det);
+    }
+    if (d.sql) {
+      const det = el("details");
+      det.append(el("summary", "", "SQL"), el("pre", "", d.sql + (d.error ? `\n\n-- error: ${d.error}` : "")));
+      reply.append(det);
+    }
+    const bits = [];
+    if (d.views && d.views.length) bits.push(`views: ${d.views.join(", ")}`);
+    if (d.data_as_of) bits.push(`data through week ending ${d.data_as_of}`);
+    if (d.cached) bits.push("cached");
+    if (bits.length) reply.append(el("div", "meta", bits.join(" · ")));
+  } catch (e) {
+    reply.textContent = ""; reply.append(el("div", "err", "Request failed: " + e));
+  } finally {
+    send.disabled = false; q.focus();
+  }
+}
+
+document.getElementById("form").onsubmit = e => { e.preventDefault(); ask(q.value); };
+</script>
+</body>
+</html>

@@ -41,6 +41,12 @@ REDSHIFT_IAM_ROLE_ARN = os.environ.get("REDSHIFT_IAM_ROLE_ARN", "")   # role Red
 RETAILER_API_URL = os.environ.get("RETAILER_API_URL", "http://localhost:9100")
 RETAILER_API_TOKEN = os.environ.get("RETAILER_API_TOKEN", "local-dev-token")
 
+# --- Analytics chatbot (chatbot/): Gemini + a read-only Redshift user ---
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+CHAT_REDSHIFT_USER = os.environ.get("CHAT_REDSHIFT_USER", "chat_reader")
+CHAT_REDSHIFT_PASSWORD = os.environ.get("CHAT_REDSHIFT_PASSWORD", "")
+
 # --- Automation window: how many weeks every scheduled run restates ---
 DEFAULT_LOOKBACK_WEEKS = int(os.environ.get("DEFAULT_LOOKBACK_WEEKS", "5"))
 

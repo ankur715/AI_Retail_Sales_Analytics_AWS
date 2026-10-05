@@ -12,9 +12,11 @@ hand-built flow per client/retailer, each with its own hard-coded parameters
 **metadata table** drives everything: one row per feed, and a DAG factory
 generates one DAG per row.
 
-The analytics chatbot over the fact table (natural language → SQL, like
-[Web_App](https://github.com/ankur715/Web_App)) is the next phase. The
-`fact.v_weekly_sales` view is already shaped for it.
+On top of the fact table, an **analytics chatbot** answers plain-English
+questions with Gemini, using the same approach as
+[Web_App](https://github.com/ankur715/Web_App): it turns the question into
+SQL against curated views, runs it with a read-only user, and summarizes
+the result. See [Analytics chatbot](#analytics-chatbot-gemini).
 
 ## Architecture
 
@@ -247,6 +249,79 @@ schedule only upserts the rolling 5 weeks. Schema changes go through
 versioned, checksummed migrations (`sql/redshift/V*.sql`) applied to dev
 first. CI runs on `dev` and `main`.
 
+## Analytics chatbot (Gemini)
+
+A separate always-on FastAPI service (`chatbot/`). It isn't part of Airflow:
+the DAGs keep the data fresh, and the chatbot only reads curated views.
+
+```
+POST /api/chat {"message": "Top 5 products for Cobalt Outdoor in the last 4 weeks"}
+ 1. route      Gemini sees only a one-line summary of each view -> picks the views it needs
+ 2. write_sql  Gemini gets ONLY those views' columns, known values and examples -> one SELECT (JSON output)
+ 3. validate   sqlglot: one read-only statement, only the routed views, LIMIT <= 500
+ 4. run        as chat_reader (SELECT on chat.* only, 30 s timeout)
+               on a validation/SQL error: one repair round with the exact error
+ 5. summarize  Gemini answers from the returned rows only, with "data through week ending ..."
+-> {answer, sql, views, columns, rows, data_as_of}
+```
+
+**Metadata limits what each question can see.** `config/chat_catalog.yaml`
+describes each curated view: a summary for routing, the grain, column
+meanings, which columns' distinct values to show, and example
+question → SQL pairs. Business rules (Saturday weeks, `weeks_ago`, never
+summing inventory across weeks) are written there once.
+- **Each question only sees what it needs:** the SQL step receives the
+  metadata of the routed views only, so prompts stay small.
+- **The validator enforces it:** queries may use only those views. A query
+  against an un-routed view, `fact.*` or `etl.*` is rejected and repaired
+  before it reaches Redshift.
+- **Separate from pipeline metadata:** `pipeline_config.csv` says how to
+  *load* a feed; `chat_catalog.yaml` says how to *ask about* the data.
+  Onboarding a new feed needs no chatbot change.
+
+| Curated view (`sql/redshift/V010__chat_views.sql`) | Grain | For |
+|---|---|---|
+| `chat.v_sales_by_week` | week × brand × retailer × category | Totals, trends, comparisons, week-over-week |
+| `chat.v_weekly_sales` | week × brand × retailer × product | Products, styles, colors, sizes, top-N, stockouts |
+| `chat.v_calendar` | week | Named months/quarters; `weeks_ago` (0 = latest loaded week) |
+| `chat.v_data_freshness` | brand × retailer | "How current is the data?" |
+
+**Guardrails:**
+- **Database access:** `chat_reader` (`python -m chatbot.setup_reader`) can
+  read only the chat schema. It has USAGE on fact/dim/etl so views resolve,
+  but no SELECT on any table there. Verified: `SELECT * FROM fact.fact_sales`
+  → *permission denied*.
+- **Query safety:** sqlglot parses the SQL rather than keyword-matching it
+  (Web_App's check would reject a column named `updated_at`). Results are
+  capped at 500 rows, with a 30 s timeout.
+- **Load and cost:** repeated questions are cached for 15 minutes, so they
+  don't call Gemini or wake Redshift.
+- **Gemini errors:**
+  - overload (503) and per-minute limits (429): retried with backoff,
+    honouring Gemini's `retryDelay`
+  - a daily quota: fails fast with a clear message instead of retrying
+- **Off-topic questions** route to no view and get a polite refusal; no SQL
+  runs.
+
+**Gemini free-tier limit:** about **20 requests per model per day** (check
+current limits). Each question uses 3 calls (route, SQL, summary), so
+that's roughly 6 new questions a day. Use `GEMINI_MODEL` to switch models
+or enable billing for real use.
+
+```bash
+RETAIL_ENV=dev .venv/bin/python -m etl.migrate          # creates the chat views (V010)
+RETAIL_ENV=dev .venv/bin/python -m chatbot.setup_reader # read-only user (CHAT_REDSHIFT_PASSWORD in .env)
+.venv/bin/uvicorn chatbot.app:app --port 8000           # http://localhost:8000
+```
+
+**Verified live** (dev):
+- *"Total sales by retailer last week"* → routed to `chat.v_sales_by_week`.
+  The SQL was right, and the answer correctly noted that only Northgate had
+  reported the latest week (Oct 17); the other feeds lag.
+- *"What is the weather in Paris?"* → no view routed and no query run.
+- Further live questions hit Gemini's free-tier daily quota of 20 requests.
+  That triggered the fail-fast quota handling above.
+
 ## Dummy data
 
 3 clients (Aurora Apparel, Bramble Footwear, Cobalt Outdoor) × 3 retailers.
@@ -305,7 +380,7 @@ To run one pipeline from the CLI without Airflow (same steps as its DAG):
 ## Tests
 
 ```bash
-.venv/bin/pytest -q tests                  # 46 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging
+.venv/bin/pytest -q tests                  # 69 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging, chatbot (routing, SQL guard, repair, cache, Gemini errors)
 cd airflow && ../.venv/bin/pytest -q tests # 12 DAG integrity tests: one DAG per pipeline, subflow shape, reconcile gates the merge, every Redshift writer pooled, priority order
 ```
 
@@ -363,6 +438,8 @@ airflow/dags/                  DAG factory + metadata sync DAG
 airflow/start_airflow.sh       local Airflow per environment
 data_gen/                      synthetic catalog + retailer file layouts
 mock_api/                      FastAPI retailer API (bearer token, cursor paging)
+chatbot/                       Gemini analytics chatbot: routing, SQL guard, read-only DB access, FastAPI + chat page
+config/chat_catalog.yaml       chatbot metadata: curated views, columns, known values, examples
 infra/terraform/               S3, IAM (COPY role + pipeline user), Redshift Serverless, usage limit
 tests/, airflow/tests/         unit + DAG integrity tests
 ```

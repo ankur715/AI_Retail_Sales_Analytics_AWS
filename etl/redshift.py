@@ -7,7 +7,8 @@ import psycopg2
 from etl import config
 
 
-def get_connection(dbname: str | None = None, attempts: int = 4):
+def get_connection(dbname: str | None = None, attempts: int = 4,
+                   user: str | None = None, password: str | None = None):
     # A paused Serverless workgroup takes a few seconds to resume on the first
     # query, so the timeout is generous; transient drops retry with backoff.
     for attempt in range(1, attempts + 1):
@@ -16,8 +17,8 @@ def get_connection(dbname: str | None = None, attempts: int = 4):
                 host=config.REDSHIFT_HOST,
                 port=config.REDSHIFT_PORT,
                 dbname=dbname or config.REDSHIFT_DB,
-                user=config.REDSHIFT_USER,
-                password=config.REDSHIFT_PASSWORD,
+                user=user or config.REDSHIFT_USER,              # the chatbot passes its read-only user
+                password=password or config.REDSHIFT_PASSWORD,
                 sslmode="require",
                 connect_timeout=30,
             )
