@@ -41,8 +41,11 @@ REDSHIFT_IAM_ROLE_ARN = os.environ.get("REDSHIFT_IAM_ROLE_ARN", "")   # role Red
 RETAILER_API_URL = os.environ.get("RETAILER_API_URL", "http://localhost:9100")
 RETAILER_API_TOKEN = os.environ.get("RETAILER_API_TOKEN", "local-dev-token")
 
-# --- Analytics chatbot (chatbot/): an LLM + a read-only Redshift user ---
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()   # gemini | bedrock
+# --- LLM features: the analytics chatbot (chatbot/) and the triage agent (triage/) ---
+# none (the default) turns every LLM feature off, so CI, tests and a fresh clone never
+# call a model. gemini | bedrock pick the chatbot's provider; the triage agent always
+# runs on Amazon Bedrock (TRIAGE_MODEL below) whenever this is not none.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "none").strip().lower()   # none | gemini | bedrock
 BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL", "claude-opus-5-5")       # or a full id / inference profile
 LLM_BEDROCK_ENDPOINT = os.environ.get("LLM_BEDROCK_ENDPOINT", "mantle").strip().lower()   # mantle | runtime
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")

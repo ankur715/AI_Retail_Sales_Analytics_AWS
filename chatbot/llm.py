@@ -20,6 +20,8 @@ PROVIDERS = {"gemini": "chatbot.llm_gemini", "bedrock": "chatbot.llm_bedrock"}
 
 def provider():
     """The provider module for LLM_PROVIDER; each exposes json_call(), text_call(), model_name()."""
+    if config.LLM_PROVIDER == "none":
+        raise LLMUnavailable("LLM features are turned off (LLM_PROVIDER=none)", kind="config")
     if config.LLM_PROVIDER not in PROVIDERS:
         raise LLMUnavailable(f"LLM_PROVIDER must be one of {sorted(PROVIDERS)}, got {config.LLM_PROVIDER!r}",
                              kind="config")

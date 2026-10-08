@@ -8,6 +8,12 @@ from fastapi.testclient import TestClient
 from chatbot import app as chat_app
 from chatbot import catalog, guard, llm, llm_bedrock, llm_gemini
 
+@pytest.fixture(autouse=True)
+def gemini_provider(monkeypatch):
+    """Chatbot tests run against the (faked) gemini provider; the suite default is none."""
+    monkeypatch.setattr(llm.config, "LLM_PROVIDER", "gemini")
+
+
 VIEWS_SQL = (Path(__file__).resolve().parent.parent / "sql" / "redshift" / "V010__chat_views.sql").read_text()
 
 
@@ -268,3 +274,11 @@ def test_unknown_provider_is_rejected(monkeypatch):
     monkeypatch.setattr(llm.config, "LLM_PROVIDER", "openai")
     with pytest.raises(llm.LLMUnavailable, match="LLM_PROVIDER must be one of"):
         llm.provider()
+
+
+def test_llm_provider_none_turns_the_chatbot_off(monkeypatch):
+    monkeypatch.setattr(llm.config, "LLM_PROVIDER", "none")
+    monkeypatch.setattr(chat_app, "_cache", {})
+    assert not llm.configured()
+    r = TestClient(chat_app.app).post("/api/chat", json={"message": "Total sales last week"})
+    assert r.status_code == 503 and "LLM_PROVIDER=none" in r.json()["detail"]

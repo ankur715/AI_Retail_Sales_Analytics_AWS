@@ -81,7 +81,9 @@ def chat(req: ChatRequest) -> ChatResponse:
     if hit and time.monotonic() - hit[0] < CACHE_TTL:
         return ChatResponse(**hit[1], cached=True)
     if not llm.configured():
-        raise HTTPException(503, f"The {config.LLM_PROVIDER} LLM is not configured on the server")
+        raise HTTPException(503, "LLM features are turned off on the server (LLM_PROVIDER=none)"
+                            if config.LLM_PROVIDER == "none" else
+                            f"The {config.LLM_PROVIDER} LLM is not configured on the server")
 
     # 1. route: only the views this question needs
     route = llm.route(question)

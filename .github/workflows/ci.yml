@@ -8,6 +8,8 @@ on:
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
+    env:
+      LLM_PROVIDER: none   # no LLM calls in CI; tests that need one fake it
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,6 +25,7 @@ jobs:
     env:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       RETAIL_ENV: dev
+      LLM_PROVIDER: none
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
