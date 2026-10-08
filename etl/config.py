@@ -53,6 +53,14 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 CHAT_REDSHIFT_USER = os.environ.get("CHAT_REDSHIFT_USER", "chat_reader")
 CHAT_REDSHIFT_PASSWORD = os.environ.get("CHAT_REDSHIFT_PASSWORD", "")
 
+# --- Pipeline Triage Agent (triage/): Bedrock Converse tool-use loop over read-only tools ---
+# nova-lite (default, cheapest) | claude-haiku | a full Bedrock model id / inference profile
+TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "nova-lite").strip()
+TRIAGE_MAX_STEPS = int(os.environ.get("TRIAGE_MAX_STEPS", "8"))          # model calls per run
+TRIAGE_MAX_TOKENS = int(os.environ.get("TRIAGE_MAX_TOKENS", "40000"))    # input + output, whole run
+TRIAGE_REDSHIFT_USER = os.environ.get("TRIAGE_REDSHIFT_USER", "triage_reader")   # read-only user
+TRIAGE_REDSHIFT_PASSWORD = os.environ.get("TRIAGE_REDSHIFT_PASSWORD", "")
+
 # --- Automation window: how many weeks every scheduled run restates ---
 DEFAULT_LOOKBACK_WEEKS = int(os.environ.get("DEFAULT_LOOKBACK_WEEKS", "5"))
 
