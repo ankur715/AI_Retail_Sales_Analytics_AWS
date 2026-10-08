@@ -527,6 +527,40 @@ file was dropped:
 .venv/bin/python -m triage.run <load_id> --write    # ...and save it to etl.load_audit
 ```
 
+### Failure email with the triage note
+
+The diagnosis goes to whoever is on call, so they get the likely cause
+along with the alert instead of having to look it up. The failure callback
+runs three isolated steps:
+1. mark the load `FAILED`
+2. triage it
+3. send **one email** (`etl/alerts.py`)
+
+```
+Subject: [retail-sales dev] FAILED C101_R201 at serial_subflow.reconcile -- A source key matches more than one STM row ...
+Body:    environment, pipeline, load, failed task, DAG run
+         Triage (suggested fix needs human approval): DIAGNOSIS / EVIDENCE / SUGGESTED FIX / CONFIDENCE
+         Error (truncated), link to the Airflow log, the audit-row query
+```
+
+- **Every final task failure is emailed.** A failure before a load
+  existed, with nothing to triage, gets an email that says so. With
+  `LLM_PROVIDER=none`, the email says the agent is off.
+- **It never masks the failure:** like the agent, `send_failure_email()`
+  logs SMTP problems and never raises.
+- **Off unless configured:** it needs `SMTP_USER`, `SMTP_PASSWORD` and
+  `ALERT_EMAIL` in `.env`, so CI and tests never send.
+  - **Gmail:** `smtp.gmail.com:587` (STARTTLS) with an **App Password**
+    (Google Account → Security → 2-Step Verification → App passwords), not
+    the account password.
+  - **Where settings live:** the recipient address and the password stay
+    in `.env`, never in committed files.
+
+```bash
+.venv/bin/python -m etl.alerts --test               # send a test email (checks the SMTP settings)
+.venv/bin/python -m etl.alerts --load <load_id>     # email an existing failed load with its saved triage note
+```
+
 ## Dummy data
 
 3 clients (Aurora Apparel, Bramble Footwear, Cobalt Outdoor) × 3 retailers.
@@ -612,8 +646,8 @@ To run one pipeline from the CLI without Airflow (same steps as its DAG):
 ## Tests
 
 ```bash
-.venv/bin/pytest -q tests                  # 90 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging, chatbot (routing, SQL guard, repair, cache, both LLM providers and their errors), triage agent (tool loop with a mocked Bedrock client, step/token caps, LLM_PROVIDER=none skip, reconcile mismatch, failure isolation, read-only queries)
-cd airflow && ../.venv/bin/pytest -q tests # 15 DAG tests: one DAG per pipeline, subflow shape, reconcile gates the merge, every Redshift writer pooled, priority order, failure path (FAILED first, triage never raises)
+.venv/bin/pytest -q tests                  # 99 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging, chatbot (routing, SQL guard, repair, cache, both LLM providers and their errors), triage agent (tool loop with a mocked Bedrock client, step/token caps, LLM_PROVIDER=none skip, reconcile mismatch, failure isolation, read-only queries), failure email (content, triage note, STARTTLS, skip when unconfigured, never raises)
+cd airflow && ../.venv/bin/pytest -q tests # 15 DAG tests: one DAG per pipeline, subflow shape, reconcile gates the merge, every Redshift writer pooled, priority order, failure path (FAILED, then triage, then email; none can raise)
 ```
 
 CI (`.github/workflows/ci.yml`) runs both suites plus `terraform fmt` and
