@@ -21,6 +21,7 @@ def main() -> None:
     ap.add_argument("--write", action="store_true", help="save the note to etl.load_audit")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("botocore").setLevel(logging.WARNING)   # only the agent's steps, not AWS SDK chatter
 
     if not agent.enabled():
         raise SystemExit("LLM_PROVIDER=none: the triage agent is turned off")
