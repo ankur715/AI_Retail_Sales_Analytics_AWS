@@ -59,28 +59,40 @@ def _ctx(d: dict):
 
 
 def _mark_failed(context) -> None:
-    """on_failure_callback (final failure only, after retries): close the load's
-    audit row as FAILED, then let the triage agent diagnose it.
+    """on_failure_callback (final failure only, after retries), in this order:
+      1. close the load's audit row as FAILED
+      2. let the triage agent diagnose it (only if a load exists)
+      3. email the failure with the triage note (etl/alerts.py)
 
-    Order and isolation matter: the FAILED status is written first, and neither
-    step may raise -- an agent or Bedrock problem must never hide or replace the
-    task's own failure, which is what Airflow keeps reporting."""
+    Each step is isolated and none may raise -- an agent, Bedrock or SMTP
+    problem must never hide or replace the task's own failure, which is what
+    Airflow keeps reporting."""
     import logging
     log = logging.getLogger(__name__)
-    load = context["ti"].xcom_pull(task_ids="begin")
-    if not load:
-        return                     # failed before a load existed (e.g. the file sensor): nothing to triage
+    ti = context["ti"]
+    load = ti.xcom_pull(task_ids="begin")
     error = repr(context.get("exception"))
+    triage = None
+    if load:
+        try:
+            from etl import steps
+            steps.fail(load["load_id"], error)
+        except Exception:
+            log.exception("could not mark %s FAILED", load["load_id"])
+        try:
+            from triage.agent import triage_failed_load
+            triage = triage_failed_load(load["load_id"], load["pipeline_id"], ti.task_id, error)
+        except Exception:
+            log.exception("triage agent errored for %s; the original failure stands", load["load_id"])
     try:
-        from etl import steps
-        steps.fail(load["load_id"], error)
+        from etl import alerts
+        alerts.send_failure_email(
+            pipeline_id=load["pipeline_id"] if load else ti.dag_id.split("__")[1],
+            load_id=load["load_id"] if load else None,
+            task_id=ti.task_id, run_id=ti.run_id, error=error, log_url=getattr(ti, "log_url", None),
+            triage_note=getattr(triage, "note", None), triage_status=getattr(triage, "status", None))
     except Exception:
-        log.exception("could not mark %s FAILED", load["load_id"])
-    try:
-        from triage.agent import triage_failed_load
-        triage_failed_load(load["load_id"], load["pipeline_id"], context["ti"].task_id, error)
-    except Exception:
-        log.exception("triage agent errored for %s; the original failure stands", load["load_id"])
+        log.exception("failure email errored; the original failure stands")
 
 
 def build_dag(p: dict) -> DAG:

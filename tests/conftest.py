@@ -12,6 +12,10 @@ os.environ.update({
     "GEMINI_MODEL": "gemini-test",
     "BEDROCK_MODEL": "claude-opus-5-5",
     "LLM_BEDROCK_ENDPOINT": "mantle",
+    # failure email off: no SMTP in tests (a developer's .env may configure it)
+    "SMTP_USER": "",
+    "SMTP_PASSWORD": "",
+    "ALERT_EMAIL": "",
     "S3_BUCKET": "test-retail-lake",
     "AWS_ACCESS_KEY_ID": "testing",
     "AWS_SECRET_ACCESS_KEY": "testing",
