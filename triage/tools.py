@@ -117,16 +117,26 @@ class Toolbox:
 
     def get_stats(self) -> dict:
         weeks = self.session.query("stats_by_week", load_id=self.target.load_id)
-        out, mismatched = [], []
+        out, mismatched, findings = [], [], []
         for w in weeks:
             diff = {m: round((w[f"src_{m}"] or 0) - (w[f"stg_{m}"] or 0) - (w[f"rej_{m}"] or 0), 2)
                     for m in ("rows", "sales", "inventory")}
             out.append({**w, "src_minus_stg_rej": diff})
             if any(diff.values()):
                 mismatched.append(w["week_date"])
-        return {"weeks": out, "weeks_not_reconciling": mismatched,
-                "note": "positive difference = rows/sales lost after src; negative = duplicated (e.g. a "
-                        "product key matching more than one STM row)" if mismatched else "every week reconciles"}
+                # Spelled out, so a small model can't misread the raw numbers.
+                parts = []
+                for m, d in diff.items():
+                    if d:
+                        src, rest = w[f"src_{m}"] or 0, (w[f"stg_{m}"] or 0) + (w[f"rej_{m}"] or 0)
+                        kind = "duplicated" if d < 0 else "lost"
+                        parts.append(f"{m} src {src} vs stg + rej {round(rest, 2)} ({abs(d)} {kind})")
+                findings.append(f"{w['week_date']}: " + "; ".join(parts))
+        return {"findings": findings or ["every week reconciles: src = stg + rej"],
+                "weeks_not_reconciling": mismatched,
+                "meaning": "stg + rej LARGER than src = rows duplicated after landing (e.g. a source key "
+                           "matching more than one STM row); SMALLER = rows lost" if mismatched else "",
+                "weeks": out}
 
     def get_unmapped_products(self) -> dict:
         rows = _read_s3_csv(self._rejects_key("unmapped_products.csv"))

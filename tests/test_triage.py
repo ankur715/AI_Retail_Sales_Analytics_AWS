@@ -187,6 +187,7 @@ def test_reconcile_mismatch_is_diagnosed_and_saved(llm_on, session, saved):
     stats = json.loads(stats_text)
     assert stats["weeks_not_reconciling"] == ["2026-10-10"]
     assert stats["weeks"][1]["src_minus_stg_rej"]["rows"] == -1     # negative = duplicated
+    assert stats["findings"][0].startswith("2026-10-10: rows src 21 vs stg + rej 22 (1 duplicated)")
     assert "src != stg + rej" in bedrock.requests[0]["messages"][0]["content"][0]["text"]
 
     # the note, model and tokens were written to the audit row by the ETL user
@@ -302,3 +303,9 @@ def test_unmapped_falls_back_to_staging_when_no_file(s3):
     assert box.get_unmapped_products() == {"source": "stage.stg_sales",
                                            "unmapped_keys": [{"src_product_key": "S99", "rows": 3}]}
     assert box.get_parse_rejects() == {"parse_rejects": 0, "note": "the parser rejected no rows for this load"}
+
+
+def test_model_thinking_tags_are_kept_out_of_the_note(llm_on, session):
+    bedrock = FakeBedrock([answer("<thinking>internal reasoning</thinking>\nDIAGNOSIS: duplicate mapping.")])
+    result = agent.triage(LOAD, PIPELINE, "t", "e", client=bedrock)
+    assert "thinking" not in result.note and result.note.startswith("DIAGNOSIS: duplicate mapping.")

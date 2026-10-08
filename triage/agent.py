@@ -20,6 +20,7 @@ Guardrails:
     replace the pipeline's own failure
 """
 import logging
+import re
 from dataclasses import dataclass, field
 
 import boto3
@@ -64,6 +65,9 @@ DIAGNOSIS: one or two sentences.
 EVIDENCE: short bullet lines starting with "- ", each citing a tool result.
 SUGGESTED FIX (needs human approval): concrete steps for a person.
 CONFIDENCE: high, medium or low."""
+
+# Some models (Nova) wrap their reasoning in <thinking> tags in the text; the note keeps only the answer.
+THINKING = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
 
 FINAL_STEP_NUDGE = ("You have reached the step limit. Do not call any more tools: write your answer now, "
                     "in the required sections, from the evidence you already have.")
@@ -138,9 +142,9 @@ def triage(load_id: str, pipeline_id: str, failed_task: str, error: str, client=
 
             message = response["output"]["message"]
             messages.append(message)
-            texts = [c["text"] for c in message["content"] if "text" in c]
-            if texts:
-                last_text = "\n".join(texts).strip()
+            texts = [THINKING.sub("", c["text"]) for c in message["content"] if "text" in c]
+            if any(t.strip() for t in texts):
+                last_text = "\n".join(t.strip() for t in texts if t.strip())
             tool_uses = [c["toolUse"] for c in message["content"] if "toolUse" in c]
 
             if response.get("stopReason") != "tool_use" or not tool_uses:
