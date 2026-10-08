@@ -556,6 +556,11 @@ Body:    environment, pipeline, load, failed task, DAG run
   - **Where settings live:** the recipient address and the password stay
     in `.env`, never in committed files.
 
+The email from the live run, carrying the agent's diagnosis of the
+duplicated mapping row (sender redacted):
+
+<img src="pics/triage_email.jpg" alt="Failure email with the triage agent's diagnosis, evidence, suggested fix and the reconcile error" width="640">
+
 ```bash
 .venv/bin/python -m etl.alerts --test               # send a test email (checks the SMTP settings)
 .venv/bin/python -m etl.alerts --load <load_id>     # email an existing failed load with its saved triage note
