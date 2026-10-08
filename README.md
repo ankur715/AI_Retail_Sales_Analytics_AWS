@@ -450,7 +450,7 @@ re-sent each step, so input dominates.
 
 | Model | Price per 1M tokens (input / output, us-east-1 on-demand) | Typical run | Worst case at the 40k-token cap |
 |---|---|---|---|
-| Nova Lite | about $0.06 / $0.24 | **about $0.001** | under $0.01 |
+| Nova Lite | about $0.06 / $0.24 | **about $0.001** (live: 6–10k tokens, under $0.001) | under $0.01 |
 | Claude Haiku 4.5 | about $1 / $5 | **about $0.02** | about $0.06–0.20 |
 
 These are estimates: check current Bedrock pricing. `triage_tokens` on
@@ -473,6 +473,29 @@ RETAIL_ENV=dev .venv/bin/python -m triage.setup_reader   # read-only user (TRIAG
 (cd infra/terraform && terraform apply)                 # allow Nova Lite in the Bedrock invoke policy
 # .env: LLM_PROVIDER=bedrock (anything but none), TRIAGE_MODEL=nova-lite or claude-haiku
 ```
+
+**Verified live** in dev, on Nova Lite. To create a real failure, one
+serial-level mapping row was duplicated in `dim.product_stm` and a new weekly
+file was dropped:
+- **The DAG:** `serial_subflow.reconcile` failed on its first try (no
+  retries), and the downstream tasks were skipped, so nothing reached the
+  fact table.
+- **The agent, from the failure callback:** called `get_load_audit`,
+  `get_stats`, `get_unmapped_products` and `get_parse_rejects` in 3 steps.
+  It used 10,124 tokens and 3 Redshift queries, and saved its note to the
+  audit row. Its diagnosis: *"a source key matches more than one row in the
+  product mapping table (STM), causing the staging join to multiply rows"*,
+  confidence high.
+- **The same load through `triage.run`:** 2 steps and 6,280 tokens, about
+  $0.0005 on Nova Lite.
+- **Two fixes from the first run:**
+  - Nova's `<thinking>` text had leaked into the note; it's now stripped.
+  - One evidence line had misread the raw stats; `get_stats` now also
+    states each mismatch in words, for example *"rows src 21 vs stg + rej
+    22 (1 duplicated)"*.
+- **Read-only confirmed:** `triage_reader` was refused `UPDATE` and
+  `DELETE` on `etl.load_audit` and `etl.etl_stats`, and `SELECT` on
+  `fact.fact_sales`.
 
 **Run it by hand** on any failed load and watch each step:
 
