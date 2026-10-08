@@ -33,7 +33,8 @@ def main() -> None:
         raise SystemExit(f"No audit row for {args.load_id}")
     audit = rows[0]
     print(f"Triage {args.load_id} ({audit['pipeline_id']}, status {audit['status']}) "
-          f"with {agent.model_id()}, at most {config.TRIAGE_MAX_STEPS} steps / {config.TRIAGE_MAX_TOKENS} tokens\n")
+          f"with {agent.model_id()}, at most {config.TRIAGE_MAX_STEPS} steps / {config.TRIAGE_MAX_TOKENS} tokens\n",
+          flush=True)   # before the agent's step log (stderr) starts
 
     run = agent.triage_failed_load if args.write else agent.triage
     result = run(args.load_id, audit["pipeline_id"], args.task, audit.get("error_message") or "unknown error")
