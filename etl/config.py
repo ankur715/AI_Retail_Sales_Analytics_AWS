@@ -61,6 +61,16 @@ TRIAGE_MAX_TOKENS = int(os.environ.get("TRIAGE_MAX_TOKENS", "40000"))    # input
 TRIAGE_REDSHIFT_USER = os.environ.get("TRIAGE_REDSHIFT_USER", "triage_reader")   # read-only user
 TRIAGE_REDSHIFT_PASSWORD = os.environ.get("TRIAGE_REDSHIFT_PASSWORD", "")
 
+# --- Failure email (etl/alerts.py): one email per final task failure, with the triage note ---
+# Off unless SMTP_USER, SMTP_PASSWORD and ALERT_EMAIL are all set (CI and tests leave them empty).
+# Gmail: smtp.gmail.com:587 with an App Password (Google Account -> Security -> App passwords).
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))           # STARTTLS
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "")               # recipient(s), comma-separated
+ALERT_FROM = os.environ.get("ALERT_FROM", "") or SMTP_USER
+
 # --- Automation window: how many weeks every scheduled run restates ---
 DEFAULT_LOOKBACK_WEEKS = int(os.environ.get("DEFAULT_LOOKBACK_WEEKS", "5"))
 
