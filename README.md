@@ -1,4 +1,4 @@
-# Retail Sales Analytics: Metadata-Driven Sell-Through Pipeline (AWS + Airflow)
+# AI Retail Sales Analytics on AWS: Metadata-Driven Pipeline, Analytics Chatbot and Pipeline Triage Agent
 
 Brands (clients) receive weekly sell-through data from their retailers:
 sales and on-hand inventory by week. Each retailer sends it in its own
