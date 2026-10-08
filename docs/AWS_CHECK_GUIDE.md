@@ -5,7 +5,7 @@ Everything this project created is tagged `Project = retail-sales`.
 
 ## 1. S3: the data lake
 
-**S3 → Buckets → `retail-sales-lake-877710816535`**
+**S3 → Buckets → `retail-sales-lake-<account-id>`**
 
 | Open | What you should see |
 |---|---|
