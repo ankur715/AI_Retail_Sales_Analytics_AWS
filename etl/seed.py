@@ -27,7 +27,7 @@ def product_rows() -> tuple[list[tuple], list[tuple]]:
         catalog = skus(client_id)
         for s in catalog:
             products.append((s.product_id, client_id, "sku", s.style, s.color, s.size, s.name, s.category, s.unit_price))
-            stm.append((client_id, "serial", s.upc, None, None, None, s.product_id))
+            stm.append((client_id, "serial", s.serial, None, None, None, s.product_id))
             stm.append((client_id, "sku", None, s.style, s.color, s.size, s.product_id))
         for style, name in style_names(client_id).items():
             price = next(s.unit_price for s in catalog if s.style == style)

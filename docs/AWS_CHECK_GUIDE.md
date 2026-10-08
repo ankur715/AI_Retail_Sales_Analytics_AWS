@@ -5,14 +5,14 @@ Everything this project created is tagged `Project = retail-sales`.
 
 ## 1. S3: the data lake
 
-**S3 → Buckets → `retail-sales-lake-877710816535`**
+**S3 → Buckets → `retail-sales-lake-<account-id>`**
 
 | Open | What you should see |
 |---|---|
 | `dev/landing/<client>/<retailer>/` | Empty after a successful run. This is where retailers drop files and the sensor looks. |
 | `dev/archive/C101/R201/` | Every processed file, renamed `<load_id>__R201_C101_<week>.csv`. The multi-file run shows three files with the same load_id prefix (`…20261010.csv`, `…20261017_part1.csv`, `…_part2.csv`). |
 | `dev/parsed/C101/R201/<load_id>/` | `output_C101_R201.csv`: the parser output Redshift COPYed. Open it to see the standard columns with `load_id` first. |
-| `dev/rejects/C101/R201/<load_id>/` | `unmapped_products.csv`: the UPC with no STM mapping (`010199999999`), with its weeks and sales. |
+| `dev/rejects/C101/R201/<load_id>/` | `unmapped_products.csv`: the serial number with no STM mapping (`010199999999`), with its weeks and sales. |
 | `dev/rejects/C101/R203/<load_id>/` | `parse_rejects.csv`: Harbor Mart's `TOTAL` row, with `reject_reason = summary/total row`. |
 | `dev/landing/C102/R202/` → archive | The API pipeline lands its JSON payload first (`R202_C102_<week>.json`), so API loads are replayable like files. |
 | `prod/` | Doesn't exist yet. Nothing has been loaded in prod. |

@@ -59,11 +59,28 @@ def _ctx(d: dict):
 
 
 def _mark_failed(context) -> None:
-    """on_failure_callback: close the load's audit row as FAILED."""
+    """on_failure_callback (final failure only, after retries): close the load's
+    audit row as FAILED, then let the triage agent diagnose it.
+
+    Order and isolation matter: the FAILED status is written first, and neither
+    step may raise -- an agent or Bedrock problem must never hide or replace the
+    task's own failure, which is what Airflow keeps reporting."""
+    import logging
+    log = logging.getLogger(__name__)
     load = context["ti"].xcom_pull(task_ids="begin")
-    if load:
+    if not load:
+        return                     # failed before a load existed (e.g. the file sensor): nothing to triage
+    error = repr(context.get("exception"))
+    try:
         from etl import steps
-        steps.fail(load["load_id"], repr(context.get("exception")))
+        steps.fail(load["load_id"], error)
+    except Exception:
+        log.exception("could not mark %s FAILED", load["load_id"])
+    try:
+        from triage.agent import triage_failed_load
+        triage_failed_load(load["load_id"], load["pipeline_id"], context["ti"].task_id, error)
+    except Exception:
+        log.exception("triage agent errored for %s; the original failure stands", load["load_id"])
 
 
 def build_dag(p: dict) -> DAG:
@@ -151,8 +168,14 @@ def build_dag(p: dict) -> DAG:
 
         @task(pool=REDSHIFT_POOL)
         def reconcile(load: dict, _stg: dict, _rej: dict) -> dict:
+            from airflow.sdk.exceptions import AirflowFailException
             from etl import steps
-            steps.reconcile(_ctx(load))
+            try:
+                steps.reconcile(_ctx(load))
+            except steps.ReconciliationError as e:
+                # A mismatch is deterministic -- retrying can't fix it -- so fail now and go
+                # straight to the failure path (audit FAILED + triage agent).
+                raise AirflowFailException(str(e)) from e
             return load
 
         @task(pool=REDSHIFT_POOL)

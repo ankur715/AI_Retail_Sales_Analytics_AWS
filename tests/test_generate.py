@@ -32,4 +32,4 @@ def test_catalog_shape():
     for client in CLIENTS:
         catalog = skus(client)
         assert len(catalog) == 20
-        assert len({s.upc for s in catalog}) == 20 and len({s.product_id for s in catalog}) == 20
+        assert len({s.serial for s in catalog}) == 20 and len({s.product_id for s in catalog}) == 20
