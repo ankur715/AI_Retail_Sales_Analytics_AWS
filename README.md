@@ -20,6 +20,11 @@ Amazon Bedrock** (as in
 or **Gemini** (as in [Web_App](https://github.com/ankur715/Web_App)). See
 [Analytics chatbot](#analytics-chatbot).
 
+When a load fails, including when the reconcile gate finds
+`src != stg + rej`, a **Pipeline Triage Agent** investigates with read-only
+tools and writes a plain-English diagnosis and suggested fix for a person
+to approve. See [Pipeline Triage Agent](#pipeline-triage-agent).
+
 ## Architecture
 
 ```
@@ -354,6 +359,128 @@ Mart, not Cobalt Outdoor", because the result columns didn't repeat the
 well. On Gemini, one question answered end to end before the free-tier
 quota ran out.
 
+## Pipeline Triage Agent
+
+When a load fails, someone has to work out why before anything can be
+fixed. The triage agent does that first pass. It reads the evidence the
+pipeline already records and writes its diagnosis and a suggested fix to
+the load's audit row. **A person reviews it and decides; the agent changes
+nothing.**
+
+```
+task fails (after retries)         reconcile finds src != stg + rej (fails at once, no retries)
+            \                       /
+             _mark_failed (DAG on_failure_callback)
+               1. etl.load_audit.status = FAILED              (as before, always first)
+               2. triage_failed_load(load, failed task, error) (never raises)
+                    Bedrock Converse loop (boto3 bedrock-runtime, toolConfig), at most 8 model calls:
+                      model -> toolUse -> read-only tool -> toolResult -> model -> ... -> final text
+               3. triage_note, triage_model, triage_tokens -> etl.load_audit  (V011)
+                                                   |
+                         a person reads the note and approves or applies the fix
+```
+
+**How it's built:** a plain tool-use loop over the Amazon Bedrock Runtime
+**Converse API** (`triage/agent.py`). It uses no Bedrock Agents,
+AgentCore, Knowledge Bases, OpenSearch, Lambda, or any service outside
+this AWS account. Each step sends the conversation plus the six tool
+definitions. The model either asks for tools, which run locally and go
+back as `toolResult` blocks, or answers in fixed sections: `DIAGNOSIS`,
+`EVIDENCE`, `SUGGESTED FIX (needs human approval)` and `CONFIDENCE`. The
+system prompt lists the common failure patterns, for example
+"stg + rej larger than src means a duplicated mapping row".
+
+**Tools** (`triage/tools.py`): fixed, read-only Python functions bound to
+the failed load, so the model can't pick another load, table or query.
+
+| Tool | Reads | Redshift queries |
+|---|---|---|
+| `get_load_audit` | The audit row: error, window, files, parse stats | 1 |
+| `get_stats` | src / stg / rej rows, sales and inventory by week, with `src - (stg + rej)` computed per week | 1 |
+| `get_unmapped_products` | The S3 `unmapped_products.csv`; `stage.stg_sales` only if no file was written | 0 or 1 |
+| `get_parse_rejects` | The S3 `parse_rejects.csv`: counts by reason plus sample rows | 0 |
+| `get_file_history` | `etl.load_files` joined to `etl.load_audit` for recent loads, plus files still in landing | 1 |
+| `get_pipeline_config` | The local metadata snapshot | 0 |
+
+So a whole investigation is **at most 4 small queries on one connection**,
+and the Serverless workgroup wakes once, usually already awake from the
+failing load. Results are cached per run, so a repeated tool call is free.
+
+**Guardrails:**
+- **Read-only:**
+  - The tools connect as `triage_reader` (`python -m triage.setup_reader`),
+    which has SELECT on exactly five tables: `etl.load_audit`,
+    `etl.etl_stats`, `etl.load_files`, `etl.pipeline_config` and
+    `stage.stg_sales`.
+  - There is no free-form SQL. The connection wrapper runs only *named*
+    queries from a fixed dictionary, and a test checks that each is a
+    single SELECT on those tables.
+  - Writing the note is a separate step, done by the ETL user.
+- **Human approves fixes:** the agent has no tool that changes anything.
+  Its fix is text in `triage_note` that a person reviews before acting, for
+  example removing a duplicate mapping row through a PR, then clearing the
+  failed task.
+- **Bounded:**
+  - `TRIAGE_MAX_STEPS` (8 model calls); on the last one the model is told
+    to answer from the evidence it has.
+  - `TRIAGE_MAX_TOKENS` (40,000 input + output for the whole run).
+  - At most 1,500 output tokens per call.
+  - Each tool result is truncated to 6,000 characters.
+  - Hitting a cap stops the loop and records its partial findings.
+- **Never masks the real failure:**
+  - The `FAILED` status is written first.
+  - The agent runs inside `try/except`, and `triage_failed_load()` never
+    raises: Bedrock errors, tool errors and save errors are logged.
+  - Airflow keeps reporting the task's own exception. A test makes both
+    steps raise and checks that the callback still returns cleanly.
+- **Off by default:** with `LLM_PROVIDER=none`, the default and what CI
+  uses, the agent is skipped without a Bedrock client being created.
+
+**Models:**
+
+| `TRIAGE_MODEL` | Bedrock model | Use |
+|---|---|---|
+| `nova-lite` (default) | `us.amazon.nova-lite-v1:0` | Cheapest model that does tool use reliably |
+| `claude-haiku` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Stronger reasoning for messier failures, about 15× the price |
+| any full id | as given | e.g. another inference profile |
+
+**Cost per run:** a typical investigation is 3–5 model calls of about
+16,000 input and 1,000 output tokens in total. The conversation is
+re-sent each step, so input dominates.
+
+| Model | Price per 1M tokens (input / output, us-east-1 on-demand) | Typical run | Worst case at the 40k-token cap |
+|---|---|---|---|
+| Nova Lite | about $0.06 / $0.24 | **about $0.001** | under $0.01 |
+| Claude Haiku 4.5 | about $1 / $5 | **about $0.02** | about $0.06–0.20 |
+
+These are estimates: check current Bedrock pricing. `triage_tokens` on
+each audit row records actual usage. The Redshift side is up to 4 small
+queries on a workgroup the failed load usually woke already. Triage runs
+only when a load fails, not on every run.
+
+> **Billing check if you use Claude:** after a Claude run, open **Billing
+> and Cost Management → Bills** and confirm the charges appear under
+> **Amazon Bedrock**, not **AWS Marketplace**. Anthropic models on Bedrock
+> can be billed through Marketplace on some accounts, and promotional AWS
+> credits often don't cover Marketplace charges. Nova Lite is an Amazon
+> model, so it always bills under Amazon Bedrock.
+
+**Setup** (once per environment):
+
+```bash
+RETAIL_ENV=dev .venv/bin/python -m etl.migrate           # V011: triage_note / triage_model / triage_tokens
+RETAIL_ENV=dev .venv/bin/python -m triage.setup_reader   # read-only user (TRIAGE_REDSHIFT_PASSWORD in .env)
+(cd infra/terraform && terraform apply)                 # allow Nova Lite in the Bedrock invoke policy
+# .env: LLM_PROVIDER=bedrock (anything but none), TRIAGE_MODEL=nova-lite or claude-haiku
+```
+
+**Run it by hand** on any failed load and watch each step:
+
+```bash
+.venv/bin/python -m triage.run <load_id>            # print the diagnosis
+.venv/bin/python -m triage.run <load_id> --write    # ...and save it to etl.load_audit
+```
+
 ## Dummy data
 
 3 clients (Aurora Apparel, Bramble Footwear, Cobalt Outdoor) × 3 retailers.
@@ -374,8 +501,8 @@ show.
 
 ```bash
 # 0. Get the code
-git clone https://github.com/ankur715/Retail_Sales_Analytics_AWS.git
-cd Retail_Sales_Analytics_AWS
+git clone https://github.com/ankur715/AI_Retail_Sales_Analytics_AWS.git
+cd AI_Retail_Sales_Analytics_AWS
 
 # 1. Infrastructure (S3, Redshift Serverless, IAM) -- ~5 min
 cd infra/terraform
@@ -439,8 +566,8 @@ To run one pipeline from the CLI without Airflow (same steps as its DAG):
 ## Tests
 
 ```bash
-.venv/bin/pytest -q tests                  # 75 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging, chatbot (routing, SQL guard, repair, cache, both LLM providers and their errors)
-cd airflow && ../.venv/bin/pytest -q tests # 12 DAG integrity tests: one DAG per pipeline, subflow shape, reconcile gates the merge, every Redshift writer pooled, priority order
+.venv/bin/pytest -q tests                  # 90 unit tests: parser layouts, multi-file precedence/parts, week windows, STM, SQL per level, S3 (moto), API paging, chatbot (routing, SQL guard, repair, cache, both LLM providers and their errors), triage agent (tool loop with a mocked Bedrock client, step/token caps, LLM_PROVIDER=none skip, reconcile mismatch, failure isolation, read-only queries)
+cd airflow && ../.venv/bin/pytest -q tests # 15 DAG tests: one DAG per pipeline, subflow shape, reconcile gates the merge, every Redshift writer pooled, priority order, failure path (FAILED first, triage never raises)
 ```
 
 CI (`.github/workflows/ci.yml`) runs both suites plus `terraform fmt` and
@@ -484,8 +611,11 @@ Step-by-step console checks (S3, Redshift Query Editor, IAM, usage limit):
 
 Redshift Serverless bills only while queries run (8 RPU base, a 3 RPU-hour
 daily usage limit that deactivates the workgroup if hit). S3 is cents.
-Sensors only list S3, so idle days cost nothing on Redshift. `terraform
-destroy` removes everything (`force_destroy` on the dummy-data bucket).
+Sensors only list S3, so idle days cost nothing on Redshift. The chatbot
+costs about a cent per question on Claude Haiku 4.5, and the triage agent
+costs about $0.001 per failed load on Nova Lite
+([cost per run](#pipeline-triage-agent)). `terraform destroy` removes
+everything (`force_destroy` on the dummy-data bucket).
 
 ## Layout
 
@@ -499,6 +629,7 @@ data_gen/                      synthetic catalog + retailer file layouts
 mock_api/                      FastAPI retailer API (bearer token, cursor paging)
 chatbot/                       analytics chatbot: routing, SQL guard, read-only DB access, Bedrock/Gemini providers, FastAPI + chat page
 config/chat_catalog.yaml       chatbot metadata: curated views, columns, known values, examples
+triage/                        Pipeline Triage Agent: Converse tool-use loop, read-only tools and session, CLI
 infra/terraform/               S3, IAM (COPY role + pipeline user), Redshift Serverless, usage limit
 tests/, airflow/tests/         unit + DAG integrity tests
 ```
