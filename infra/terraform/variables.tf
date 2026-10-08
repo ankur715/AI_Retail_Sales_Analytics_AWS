@@ -49,7 +49,10 @@ variable "redshift_daily_rpu_hours" {
 }
 
 variable "chatbot_bedrock_models" {
-  description = "Bedrock model ids the chatbot may invoke through us.* inference profiles."
+  description = "Bedrock model ids the chatbot and the triage agent may invoke through us.* inference profiles."
   type        = list(string)
-  default     = ["anthropic.claude-haiku-4-5-20251001-v1:0"]
+  default = [
+    "anthropic.claude-haiku-4-5-20251001-v1:0", # chatbot (LLM_PROVIDER=bedrock) and TRIAGE_MODEL=claude-haiku
+    "amazon.nova-lite-v1:0",                    # triage agent default (TRIAGE_MODEL=nova-lite)
+  ]
 }

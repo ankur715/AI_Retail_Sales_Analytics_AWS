@@ -248,9 +248,10 @@ resource "aws_redshiftserverless_usage_limit" "daily_compute" {
 }
 
 # ---------------------------------------------------------------------------
-# Chatbot LLM on Amazon Bedrock: the pipeline user (which the local chatbot
-# runs as) may invoke only the listed Claude inference profiles and the
-# foundation models they route to -- nothing else in Bedrock.
+# LLMs on Amazon Bedrock (chatbot + Pipeline Triage Agent): the pipeline user,
+# which the local chatbot and Airflow run as, may invoke only the listed
+# models' us.* inference profiles and the foundation models they route to --
+# nothing else in Bedrock. Converse calls are authorized as bedrock:InvokeModel.
 # ---------------------------------------------------------------------------
 
 resource "aws_iam_user_policy" "chatbot_bedrock" {
