@@ -3,7 +3,7 @@ from datetime import date
 
 import pytest
 
-from data_gen.catalog import UNMAPPED_UPC, load_pipelines
+from data_gen.catalog import UNMAPPED_SERIAL, load_pipelines
 from data_gen.generate import api_records, normalized_rows, render
 from etl.parsers import OUTPUT_COLUMNS, parse
 from etl.weeks import week_range
@@ -36,11 +36,11 @@ def test_every_layout_normalizes_to_standard_columns(pipeline_id):
     assert (res.output["load_id"] == "L1").all()
 
 
-def test_serial_upcs_keep_leading_zeros_and_money_is_parsed():
+def test_serial_numbers_keep_leading_zeros_and_money_is_parsed():
     res = run("C101_R201")
     assert res.output["product_id"].str.len().eq(12).all()
     assert res.output["product_id"].str.startswith("0").all()
-    assert UNMAPPED_UPC["C101"] in set(res.output["product_id"])
+    assert UNMAPPED_SERIAL["C101"] in set(res.output["product_id"])
     assert res.output["sales"].dtype.kind == "f" and res.output["sales"].ge(0).all()
 
 

@@ -3,7 +3,7 @@ truth for the dimension seed (etl.seed), the dummy source files
 (data_gen.generate) and the mock retailer API (mock_api).
 
 Each client (a brand) has 5 styles x 2 colors x 2 sizes = 20 SKUs. Every
-SKU has a retailer-facing UPC (what serial-level feeds report) and an
+SKU has a retailer-facing serial number (what serial-level feeds report) and an
 internal product_id; every style also has a style-level product_id (what
 style-level feeds map to).
 
@@ -33,7 +33,7 @@ COLORS = ["BLK", "NVY"]
 SIZES = ["M", "L"]
 
 # Source keys with no STM row -> rejected (product_id IS NULL in staging).
-UNMAPPED_UPC = {c: f"0{c[1:]}99999999" for c in CLIENTS}       # serial level
+UNMAPPED_SERIAL = {c: f"0{c[1:]}99999999" for c in CLIENTS}    # serial level
 UNMAPPED_SKU = ("S03", "GRN", "M")                             # sku level: a color the brand never set up
 UNMAPPED_STYLE = "S99"                                         # style level: a style not yet in the catalog
 
@@ -44,7 +44,7 @@ class Sku:
     style: str          # S01..S05
     color: str
     size: str
-    upc: str            # 12-digit, leading zero -- must stay a string end to end
+    serial: str         # 12-digit serial number, leading zero -- must stay a string end to end
     product_id: str     # internal SKU-level product id
     style_product_id: str
     name: str
@@ -70,7 +70,7 @@ def skus(client_id: str) -> list[Sku]:
                 n += 1
                 out.append(Sku(
                     client_id=client_id, style=style, color=color, size=size,
-                    upc=f"0{client_id[1:]}{n:08d}",
+                    serial=f"0{client_id[1:]}{n:08d}",
                     product_id=f"{client_id}-P{n:03d}",
                     style_product_id=f"{client_id}-{style}",
                     name=f"{style_name} {color} {size}",

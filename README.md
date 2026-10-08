@@ -88,7 +88,7 @@ retail_sales__C102_R202__sku      (api, Sundays) begin ─► extract_api ─►
 
 | Level | Source columns | Landing | Maps on (`dim.product_stm`) |
 |---|---|---|---|
-| serial | week_date, client, retailer, product_id, sales, inventory | `tmp_serial` | `src_product_id` (retailer UPC → internal SKU `product_id`) |
+| serial | week_date, client, retailer, product_id, sales, inventory | `tmp_serial` | `src_product_id` (retailer serial number → internal SKU `product_id`) |
 | sku (style-color-size) | week_date, retailer, client, style, color, size, sales, inventory | `tmp_sku` → `prestg_sku` | `style + color + size` → SKU `product_id` |
 | style | week_date, retailer, client, style, sales, inventory | `tmp_style` → `prestg_style` | `style` → style-level `product_id` |
 
@@ -487,7 +487,7 @@ RETAIL_ENV=dev .venv/bin/python -m triage.setup_reader   # read-only user (TRIAG
 Each client has 20 SKUs (5 styles × 2 colors × 2 sizes) and 12 weeks of
 history plus one weekly drop. `data_gen/` produces each retailer's messy
 layout:
-- R201: `MM/DD/YYYY` dates, `"$1,234.50"` amounts, UPCs with leading zeros
+- R201: `MM/DD/YYYY` dates, `"$1,234.50"` amounts, serial numbers with leading zeros
 - R202: XLSX with a title row above the header, one row per store
 - R203: padded lower-case headers and a `TOTAL` row at the bottom
 - API: camelCase JSON, cursor-paged

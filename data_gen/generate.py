@@ -4,7 +4,7 @@ Every retailer reports week-ending-Saturday sales and on-hand inventory, but
 each one has its own file shape -- that's why a parser sits in front of the
 load:
 
-    R201 Northgate  serial level  CSV   MM/DD/YYYY dates, "$1,234.50" sales, UPCs with leading zeros
+    R201 Northgate  serial level  CSV   MM/DD/YYYY dates, "$1,234.50" sales, serial numbers with leading zeros
     R202 Summit     SKU level     XLSX  title row above the header, one row per store
     R203 Harbor     style level   CSV   lower-case padded headers, one row per store, a TOTAL row at the bottom
     API  (C102 at R202)           JSON  camelCase fields, cursor-paged (see mock_api/)
@@ -29,7 +29,7 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from data_gen.catalog import (
-    CLIENTS, RETAILERS, UNMAPPED_SKU, UNMAPPED_STYLE, UNMAPPED_UPC,
+    CLIENTS, RETAILERS, UNMAPPED_SERIAL, UNMAPPED_SKU, UNMAPPED_STYLE,
     load_pipelines, skus, stable_rng,
 )
 from etl.weeks import is_week_end, week_range
@@ -57,11 +57,11 @@ def normalized_rows(client: str, retailer: str, level: str, weeks: list[date], a
     rows = []
     for week in weeks:
         if level == "serial":
-            keys = [(s.upc, s.unit_price) for s in catalog] + [(UNMAPPED_UPC[client], 24.99)]
-            for upc, unit_price in keys:
-                units, on_hand = _units(client, retailer, upc, 0, week, as_of)
+            keys = [(s.serial, s.unit_price) for s in catalog] + [(UNMAPPED_SERIAL[client], 24.99)]
+            for serial, unit_price in keys:
+                units, on_hand = _units(client, retailer, serial, 0, week, as_of)
                 rows.append({"week_date": week, "client_id": client, "retailer_id": retailer,
-                             "product_id": upc, "sales": round(units * unit_price, 2), "inventory": on_hand})
+                             "product_id": serial, "sales": round(units * unit_price, 2), "inventory": on_hand})
         elif level == "sku":
             keys = [(s.style, s.color, s.size, s.unit_price) for s in catalog]
             keys.append((*UNMAPPED_SKU, catalog[8].unit_price))   # catalog[8] is S03: same style, a color that isn't set up

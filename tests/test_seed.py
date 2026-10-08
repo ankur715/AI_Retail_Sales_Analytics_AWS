@@ -1,6 +1,6 @@
 from collections import Counter
 
-from data_gen.catalog import CLIENTS, UNMAPPED_SKU, UNMAPPED_STYLE, UNMAPPED_UPC
+from data_gen.catalog import CLIENTS, UNMAPPED_SERIAL, UNMAPPED_SKU, UNMAPPED_STYLE
 from etl.seed import pipeline_rows, product_rows
 
 
@@ -21,7 +21,7 @@ def test_every_stm_target_exists_in_dim_product():
 def test_deliberately_unmapped_keys_are_absent():
     _, stm = product_rows()
     for client in CLIENTS:
-        assert not any(r[0] == client and r[2] == UNMAPPED_UPC[client] for r in stm)
+        assert not any(r[0] == client and r[2] == UNMAPPED_SERIAL[client] for r in stm)
         assert not any(r[0] == client and r[1] == "style" and r[3] == UNMAPPED_STYLE for r in stm)
     assert not any(r[1] == "sku" and tuple(r[3:6]) == UNMAPPED_SKU for r in stm)
 

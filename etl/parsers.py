@@ -7,7 +7,7 @@ What it handles (see data_gen/generate.py for the raw layouts):
   - a title row above the header (XLSX exports)
   - dates as MM/DD/YYYY, ISO, or Excel datetimes
   - "$1,234.50" money strings
-  - UPC product ids with leading zeros (read as text, never as numbers)
+  - serial-number product ids with leading zeros (read as text, never as numbers)
   - summary/TOTAL rows and blank rows
   - files routed to the wrong pipeline (client/retailer mismatch)
   - feeds with no client/retailer column (a vendor-portal export is already
@@ -46,7 +46,7 @@ SYNONYMS = {
     "weekdate": "week_date", "weekending": "week_date", "weekenddate": "week_date",
     "client": "client_id", "clientid": "client_id", "vendor": "client_id",
     "retailer": "retailer_id", "retailerid": "retailer_id",
-    "productid": "product_id", "upc": "product_id", "serial": "product_id",
+    "productid": "product_id", "serial": "product_id", "serialnumber": "product_id",
     "style": "style", "color": "color", "size": "size",
     "sales": "sales", "salesamount": "sales", "netsales": "sales",
     "inventory": "inventory", "inventoryunits": "inventory", "onhandunits": "inventory", "onhand": "inventory",
@@ -77,7 +77,7 @@ def _norm(header) -> str:
 
 
 def read_raw(body: bytes, file_format: str) -> pd.DataFrame:
-    """Raw bytes -> DataFrame of strings (dtype=str keeps UPC leading zeros)."""
+    """Raw bytes -> DataFrame of strings (dtype=str keeps serial-number leading zeros)."""
     if file_format == "csv":
         return pd.read_csv(io.BytesIO(body), dtype=str, keep_default_na=False)
     if file_format == "xlsx":
