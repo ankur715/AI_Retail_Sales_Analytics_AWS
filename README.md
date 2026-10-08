@@ -497,6 +497,29 @@ file was dropped:
   `DELETE` on `etl.load_audit` and `etl.etl_stats`, and `SELECT` on
   `fact.fact_sales`.
 
+**The live run, in screenshots:**
+
+1. Reconcile failed on the first try; merge, archive and finish were
+   skipped, so nothing reached the fact table.
+
+   ![Airflow: the C101_R201 run failed at reconcile, downstream tasks skipped](pics/triage_dag_failed.jpg)
+
+2. The agent ran from the failure callback. The task log shows the
+   reconcile error, then each tool call and the result: *answered (3
+   steps, 10124 tokens, 3 Redshift queries)*.
+
+   ![Airflow task log: reconcile failure followed by the triage agent's tool calls](pics/triage_airflow_log.png)
+
+3. The same load through the CLI: the steps, then the diagnosis and the
+   suggested fix for a person to approve.
+
+   <img src="pics/triage_cli.jpg" alt="Terminal: python -m triage.run printing the agent's steps and diagnosis" width="640">
+
+4. The note saved on each failed load's audit row, with the model and the
+   tokens used, in Redshift Query Editor v2.
+
+   ![Redshift Query Editor: etl.load_audit rows with triage_model, triage_tokens and triage_note](pics/triage_audit_row.jpg)
+
 **Run it by hand** on any failed load and watch each step:
 
 ```bash
