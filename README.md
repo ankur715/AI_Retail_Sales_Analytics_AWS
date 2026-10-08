@@ -25,6 +25,22 @@ When a load fails, including when the reconcile gate finds
 tools and writes a plain-English diagnosis and suggested fix for a person
 to approve. See [Pipeline Triage Agent](#pipeline-triage-agent).
 
+## At a glance
+
+| | What it does | Built with |
+|---|---|---|
+| **Metadata-driven pipeline** | One DAG per client/retailer feed, generated from a metadata table; serial, SKU and style feeds converge on one weekly fact table, upserted over a rolling 5-week window | Airflow 3, S3, Redshift Serverless, Terraform |
+| **Reconcile gate** | Nothing reaches the fact table unless `src = stg + rej` for every week, in rows, sales and inventory | `etl.etl_stats`, `etl.load_audit` |
+| **Analytics chatbot** | Plain-English question → SQL on curated views (read-only user, validated SQL) → answer with its data | FastAPI, Claude on Bedrock or Gemini |
+| **Pipeline Triage Agent** | When a load fails, investigates with read-only tools and writes a diagnosis and a fix for a person to approve | Bedrock Converse tool use, Nova Lite (Claude Haiku 4.5 optional) |
+
+<table>
+<tr>
+<td width="50%" valign="top"><b>Analytics chatbot</b><br><a href="#analytics-chatbot"><img src="pics/chatbot.jpg" alt="Chatbot answering sales questions with data tables"></a></td>
+<td width="50%" valign="top"><b>Pipeline Triage Agent</b>: a reconcile failure diagnosed for under a tenth of a cent<br><a href="#pipeline-triage-agent"><img src="pics/triage_cli.jpg" alt="Triage agent diagnosing a reconcile failure in the terminal"></a></td>
+</tr>
+</table>
+
 ## Architecture
 
 ```
@@ -40,6 +56,10 @@ to approve. See [Pipeline Triage Agent](#pipeline-triage-agent).
    etl.pipeline_config ─► DAG factory      dim.product, dim.product_stm (source-to-target map)
    landing.tmp_<level> ─► landing.prestg_<level> ─► stage.stg_sales ─MERGE─► fact.fact_sales
    etl.etl_stats (src / stg / rej)   etl.load_audit   etl.v_load_reconciliation   fact.v_weekly_sales
+        │                                  ▲                                       │
+        │ failed load                      │ triage_note (for a person to approve) │ chat.* views
+        ▼                                  │                                       ▼
+ Pipeline Triage Agent: Bedrock Converse + 6 read-only tools        Analytics chatbot (FastAPI + LLM)
 ```
 
 ### One DAG per metadata row
